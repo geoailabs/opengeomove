@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import duckdb
 
 from opengeomove.eda.accessor import EDAAccessor
 
 _DISPLAY_MAX_ROWS = 5
+_ITER_BATCH_SIZE = 1024
 
 
 class Dataset(EDAAccessor):
@@ -52,6 +54,20 @@ class Dataset(EDAAccessor):
         return self._metadata_cache["columns"]
 
     @property
+    def dtypes(self) -> OrderedDict[str, Any]:
+        """Return column names and DuckDB types in source column order.
+
+        The mapping is built from relation schema metadata and does not scan
+        dataset rows. A fresh mapping is returned so caller edits cannot
+        affect the Dataset's cached metadata.
+        """
+        if "dtypes" not in self._metadata_cache:
+            self._metadata_cache["dtypes"] = tuple(
+                zip(self._relation.columns, self._relation.types)
+            )
+        return OrderedDict(self._metadata_cache["dtypes"])
+
+    @property
     def shape(self) -> tuple[int, int]:
         """Return and cache ``(row_count, column_count)``.
 
@@ -73,6 +89,22 @@ class Dataset(EDAAccessor):
     def format(self) -> str:
         """Return the normalized source format name."""
         return self._format
+
+    @property
+    def rows(self) -> Iterator[tuple[Any, ...]]:
+        """Return a lazy iterator yielding all rows as tuples.
+
+        Rows are fetched from DuckDB in bounded batches, so accessing this
+        property does not collect the full dataset in Python memory. Accessing
+        ``rows`` again creates a fresh iterator over the Dataset relation.
+        """
+        relation = self._relation.project("*")
+        while batch := relation.fetchmany(_ITER_BATCH_SIZE):
+            yield from batch
+
+    def __iter__(self) -> Iterator[tuple[Any, ...]]:
+        """Iterate over all dataset rows as tuples in column order."""
+        return self.rows
 
     def _prime_metadata(self) -> None:
         """Resolve and cache the metadata currently supported by Dataset."""
