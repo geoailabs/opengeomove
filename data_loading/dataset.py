@@ -1,0 +1,100 @@
+"""Common lazy dataset object returned by OpenGeoMove data readers."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import duckdb
+
+from opengeomove.eda.accessor import EDAAccessor
+
+_DISPLAY_MAX_ROWS = 5
+
+
+class Dataset(EDAAccessor):
+    """A read-only, lazy view over a source file scanned by DuckDB.
+
+    Args:
+        relation: DuckDB relation representing the source or a derived query.
+        connection: Connection that owns the relation.
+        source_path: Original source path, retained for derived datasets.
+        data_format: Normalized source format name.
+        eager_metadata: If true, resolve the shape during construction.
+
+    The object retains a query relation rather than materializing every row in
+    Python. Metadata properties and derived EDA operations execute only the
+    work they require, and derived datasets do not modify their source.
+    """
+
+    def __init__(
+        self,
+        relation: duckdb.DuckDBPyRelation,
+        connection: duckdb.DuckDBPyConnection,
+        source_path: Path,
+        data_format: str,
+        eager_metadata: bool = False,
+    ) -> None:
+        """Create a Dataset around a DuckDB relation and its connection."""
+        self._relation = relation
+        self._connection = connection
+        self._source_path = source_path
+        self._format = data_format
+        self._metadata_cache: dict[str, Any] = {}
+        if eager_metadata:
+            self._prime_metadata()
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """Return and cache the source column names as an immutable tuple."""
+        if "columns" not in self._metadata_cache:
+            self._metadata_cache["columns"] = tuple(self._relation.columns)
+        return self._metadata_cache["columns"]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Return and cache ``(row_count, column_count)``.
+
+        DuckDB computes the row count when this property is first accessed.
+        For large text files this can require scanning the complete source,
+        though the result itself is only a scalar and is cached per Dataset.
+        """
+        if "shape" not in self._metadata_cache:
+            row_count, _ = self._relation.shape
+            self._metadata_cache["shape"] = (int(row_count), len(self.columns))
+        return self._metadata_cache["shape"]
+
+    @property
+    def source(self) -> Path:
+        """Return the local path from which this Dataset was opened."""
+        return self._source_path
+
+    @property
+    def format(self) -> str:
+        """Return the normalized source format name."""
+        return self._format
+
+    def _prime_metadata(self) -> None:
+        """Resolve and cache the metadata currently supported by Dataset."""
+        _ = self.columns
+        _ = self.shape
+
+    def _clone_with_relation(self, relation: duckdb.DuckDBPyRelation) -> Dataset:
+        """Create a derived Dataset sharing this object's connection."""
+        return Dataset(
+            relation=relation,
+            connection=self._connection,
+            source_path=self._source_path,
+            data_format=self._format,
+        )
+
+    def __repr__(self) -> str:
+        """Render a bounded preview without computing the complete row count."""
+        preview = self._relation.limit(_DISPLAY_MAX_ROWS + 1)
+        fetched_rows = preview.fetchall()
+        has_more_rows = len(fetched_rows) > _DISPLAY_MAX_ROWS
+        rows = fetched_rows[:_DISPLAY_MAX_ROWS]
+        return (
+            f"Dataset(format={self._format!r}, columns={tuple(preview.columns)!r}, "
+            f"preview={rows!r}, more_rows={has_more_rows})"
+        )
