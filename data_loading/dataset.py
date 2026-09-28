@@ -43,6 +43,7 @@ class Dataset(EDAAccessor):
         self._source_path = source_path
         self._format = data_format
         self._metadata_cache: dict[str, Any] = {}
+        self._filters: tuple[Any, ...] = ()
         if eager_metadata:
             self._prime_metadata()
 
@@ -91,6 +92,48 @@ class Dataset(EDAAccessor):
         return self._format
 
     @property
+    def filters(self) -> tuple[Any, ...]:
+        """Return the filter objects that define this Dataset's current view."""
+        return self._filters
+
+    def apply(self, *filters: Any) -> Dataset:
+        """Return a lazy Dataset with the supplied filters added to its view.
+
+        Filters are executed by DuckDB when a later operation consumes the
+        relation. They never delete or rewrite source data. The current Dataset
+        is unchanged; the returned Dataset carries the added filters, and
+        filters can be composed in one call or across chained calls.
+
+        Args:
+            *filters: Instances of filters exposed through ``ogm.processing``.
+
+        Returns:
+            A new Dataset whose query plan includes all existing and supplied
+            filters.
+
+        Raises:
+            TypeError: If no filters are supplied or an argument is not a
+                supported filter instance.
+            ValueError: If a filter references a missing column or has invalid
+                parameters.
+        """
+        if not filters:
+            raise TypeError("apply() requires at least one filter instance")
+
+        relation = self._relation
+        for filter_obj in filters:
+            apply_filter = getattr(filter_obj, "_apply", None)
+            if not callable(apply_filter):
+                raise TypeError(
+                    "apply() arguments must be filter instances from ogm.processing"
+                )
+            relation = apply_filter(relation, self._connection)
+
+        derived = self._clone_with_relation(relation)
+        derived._filters = (*self._filters, *filters)
+        return derived
+
+    @property
     def rows(self) -> Iterator[tuple[Any, ...]]:
         """Return a lazy iterator yielding all rows as tuples.
 
@@ -113,12 +156,14 @@ class Dataset(EDAAccessor):
 
     def _clone_with_relation(self, relation: duckdb.DuckDBPyRelation) -> Dataset:
         """Create a derived Dataset sharing this object's connection."""
-        return Dataset(
+        derived = Dataset(
             relation=relation,
             connection=self._connection,
             source_path=self._source_path,
             data_format=self._format,
         )
+        derived._filters = self._filters
+        return derived
 
     def __str__(self) -> str:
         """Render up to five rows as readable text without counting all rows.

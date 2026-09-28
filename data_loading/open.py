@@ -60,6 +60,8 @@ def open(path: PathLike, *, eager_metadata: bool = False) -> Dataset:
     resolved_path = source_path.resolve()
     connection = duckdb.connect(database=":memory:")
     try:
+        # Make DuckDB's implicit timestamp casts deterministic across machines.
+        connection.execute("SET TimeZone = 'UTC'")
         if suffix == ".parquet":
             relation = connection.read_parquet(str(resolved_path))
             data_format = "parquet"
