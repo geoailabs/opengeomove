@@ -57,7 +57,7 @@ def isna(dataset: Dataset) -> Dataset:
     if not expressions:
         relation = dataset._relation
     else:
-        relation = dataset._relation.project(*expressions)
+        relation = dataset._relation.project(", ".join(expressions))
     return dataset._clone_with_relation(relation)
 
 
@@ -88,7 +88,7 @@ def notna(dataset: Dataset) -> Dataset:
     if not expressions:
         relation = dataset._relation
     else:
-        relation = dataset._relation.project(*expressions)
+        relation = dataset._relation.project(", ".join(expressions))
     return dataset._clone_with_relation(relation)
 
 

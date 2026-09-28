@@ -88,8 +88,31 @@ class Dataset(EDAAccessor):
             data_format=self._format,
         )
 
+    def __str__(self) -> str:
+        """Render up to five rows as readable text without counting all rows.
+
+        Printing a Dataset materializes only a bounded preview. If the
+        relation has more than five rows, the output notes that rows were
+        omitted; use :meth:`head` to create a smaller Dataset to print.
+        """
+        preview = self._relation.limit(_DISPLAY_MAX_ROWS + 1)
+        fetched_rows = preview.fetchall()
+        rows = fetched_rows[:_DISPLAY_MAX_ROWS]
+        columns = tuple(preview.columns)
+        if not columns:
+            rendered = "(no columns)"
+        else:
+            rendered = " | ".join(columns)
+            for row in rows:
+                rendered += "\n" + " | ".join(repr(value) for value in row)
+        if not rows:
+            rendered += "\n(no rows)"
+        if len(fetched_rows) > _DISPLAY_MAX_ROWS:
+            rendered += f"\n... (showing first {_DISPLAY_MAX_ROWS} rows)"
+        return rendered
+
     def __repr__(self) -> str:
-        """Render a bounded preview without computing the complete row count."""
+        """Render a bounded diagnostic summary without counting all rows."""
         preview = self._relation.limit(_DISPLAY_MAX_ROWS + 1)
         fetched_rows = preview.fetchall()
         has_more_rows = len(fetched_rows) > _DISPLAY_MAX_ROWS
