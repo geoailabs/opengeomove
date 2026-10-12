@@ -86,6 +86,55 @@ class MobilityTests(unittest.TestCase):
 
         self.assertEqual(trips.shape[0], 0)
 
+    def test_reusable_thresholds_apply_to_stops_and_trips(self) -> None:
+        """Use one immutable threshold set for both analysis stages."""
+        thresholds = ogm.MobilityThresholds(
+            max_distance_m=100,
+            min_stop_duration_s=300,
+            max_time_gap_s=900,
+            trip_max_time_gap_s=901,
+        )
+        stops = self.dataset.cluster_stops(
+            device_id_col="device_id",
+            timestamp_col="observed_at",
+            lat_col="lat",
+            lon_col="lon",
+            thresholds=thresholds,
+        )
+        trips = stops.form_trips(thresholds=thresholds)
+
+        self.assertEqual(stops.shape[0], 3)
+        self.assertEqual(trips.shape[0], 1)
+
+    def test_stop_centroid_handles_points_across_the_date_line(self) -> None:
+        """Use a spherical center instead of averaging longitude through zero."""
+        path = Path(self._temporary_directory.name) / "date-line.parquet"
+        connection = duckdb.connect()
+        connection.execute(
+            """COPY (SELECT * FROM (VALUES
+                ('c', TIMESTAMP '2025-01-01 00:00:00', 0.0::DOUBLE, 179.999::DOUBLE),
+                ('c', TIMESTAMP '2025-01-01 00:02:00', 0.0::DOUBLE, -179.999::DOUBLE)
+            ) AS points(device_id, observed_at, lat, lon)) TO ? (FORMAT PARQUET)""",
+            [str(path)],
+        )
+        connection.close()
+        dataset = ogm.open(path)
+        try:
+            stops = dataset.cluster_stops(
+                device_id_col="device_id",
+                timestamp_col="observed_at",
+                lat_col="lat",
+                lon_col="lon",
+                max_distance_m=300,
+                min_stop_duration_s=60,
+                max_time_gap_s=300,
+            )
+
+            stop = next(iter(stops.rows))
+            self.assertAlmostEqual(abs(stop[5]), 180.0, places=3)
+        finally:
+            dataset._connection.close()
+
     def test_invalid_thresholds_and_columns_are_rejected(self) -> None:
         """Validate user-specified columns and clustering parameters."""
         with self.assertRaises(ValueError):

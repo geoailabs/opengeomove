@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from opengeomove.mobility.config import MobilityThresholds
 from opengeomove.mobility.operations import cluster_stops, form_trips
 
 if TYPE_CHECKING:
@@ -20,9 +21,10 @@ class MobilityAccessor:
         timestamp_col: str,
         lat_col: str,
         lon_col: str,
-        max_distance_m: float,
-        min_stop_duration_s: float,
-        max_time_gap_s: float,
+        max_distance_m: float | None = None,
+        min_stop_duration_s: float | None = None,
+        max_time_gap_s: float | None = None,
+        thresholds: MobilityThresholds | None = None,
         source_timezone: str = "UTC",
         timestamp_unit: str = "auto",
     ) -> Dataset:
@@ -36,6 +38,8 @@ class MobilityAccessor:
             max_distance_m: Maximum candidate radius from its first ping.
             min_stop_duration_s: Minimum observed stop duration in seconds.
             max_time_gap_s: Maximum gap between consecutive candidate pings.
+            thresholds: Reusable caller-selected thresholds. Pass this instead
+                of the three individual stop thresholds.
             source_timezone: Timezone for naive source timestamps.
             timestamp_unit: ``"auto"``, ``"ms"``, or ``"s"`` for epochs.
 
@@ -55,15 +59,23 @@ class MobilityAccessor:
             max_distance_m=max_distance_m,
             min_stop_duration_s=min_stop_duration_s,
             max_time_gap_s=max_time_gap_s,
+            thresholds=thresholds,
             source_timezone=source_timezone,
             timestamp_unit=timestamp_unit,
         )
 
-    def form_trips(self: Dataset, *, max_time_gap_s: float) -> Dataset:
+    def form_trips(
+        self: Dataset,
+        *,
+        max_time_gap_s: float | None = None,
+        thresholds: MobilityThresholds | None = None,
+    ) -> Dataset:
         """Return trips between consecutive stop clusters for each device.
 
         Args:
             max_time_gap_s: Maximum time between consecutive stops, in seconds.
+            thresholds: Reusable threshold set with
+                ``trip_max_time_gap_s`` configured.
 
         Returns:
             A Dataset with one summary row per qualifying trip.
@@ -73,4 +85,8 @@ class MobilityAccessor:
             ValueError: If required stop columns are absent or the threshold
                 is invalid.
         """
-        return form_trips(self, max_time_gap_s=max_time_gap_s)
+        return form_trips(
+            self,
+            max_time_gap_s=max_time_gap_s,
+            thresholds=thresholds,
+        )

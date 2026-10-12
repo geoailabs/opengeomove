@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import duckdb
 
 from opengeomove.data_cleaning.filters import _utc_timestamp_expression, _validate_timezone
+from opengeomove.mobility.config import MobilityThresholds
 
 if TYPE_CHECKING:
     from opengeomove.data_loading.dataset import Dataset
@@ -70,6 +71,22 @@ def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(haversine)))
 
 
+def _spherical_centroid(
+    x_sum: float,
+    y_sum: float,
+    z_sum: float,
+    fallback: tuple[float, float],
+) -> tuple[float, float]:
+    """Return a longitude/latitude centroid from accumulated unit vectors."""
+    if math.isclose(x_sum, 0.0, abs_tol=1e-15) and math.isclose(
+        y_sum, 0.0, abs_tol=1e-15
+    ) and math.isclose(z_sum, 0.0, abs_tol=1e-15):
+        return fallback
+    latitude = math.degrees(math.atan2(z_sum, math.hypot(x_sum, y_sum)))
+    longitude = math.degrees(math.atan2(y_sum, x_sum))
+    return latitude, longitude
+
+
 def _timestamp_seconds(value: datetime) -> float:
     """Return an aware datetime's Unix timestamp in seconds."""
     return _utc_datetime(value).timestamp()
@@ -121,9 +138,10 @@ def cluster_stops(
     timestamp_col: str,
     lat_col: str,
     lon_col: str,
-    max_distance_m: float,
-    min_stop_duration_s: float,
-    max_time_gap_s: float,
+    max_distance_m: float | None = None,
+    min_stop_duration_s: float | None = None,
+    max_time_gap_s: float | None = None,
+    thresholds: MobilityThresholds | None = None,
     source_timezone: str = "UTC",
     timestamp_unit: str = "auto",
 ) -> Dataset:
@@ -147,6 +165,8 @@ def cluster_stops(
         min_stop_duration_s: Minimum observed candidate duration, in seconds.
         max_time_gap_s: A larger gap between consecutive pings ends a
             candidate, in seconds.
+        thresholds: Optional reusable threshold set. Supply this or all three
+            individual stop thresholds.
         source_timezone: Timezone for naive source timestamps. Defaults to UTC.
         timestamp_unit: ``"auto"``, ``"ms"``, or ``"s"`` for numeric epochs.
 
@@ -174,11 +194,29 @@ def cluster_stops(
     ):
         _quote_identifier(value)
     _require_columns(dataset, (device_id_col, timestamp_col, lat_col, lon_col))
-    max_distance_m = _positive_number(max_distance_m, "max_distance_m")
-    min_stop_duration_s = _positive_number(
-        min_stop_duration_s, "min_stop_duration_s", allow_zero=True
-    )
-    max_time_gap_s = _positive_number(max_time_gap_s, "max_time_gap_s")
+    individual_thresholds = (max_distance_m, min_stop_duration_s, max_time_gap_s)
+    if thresholds is not None:
+        if not isinstance(thresholds, MobilityThresholds):
+            raise TypeError("thresholds must be a MobilityThresholds instance")
+        if any(value is not None for value in individual_thresholds):
+            raise ValueError("supply thresholds or individual stop thresholds, not both")
+        max_distance_m = thresholds.max_distance_m
+        min_stop_duration_s = thresholds.min_stop_duration_s
+        max_time_gap_s = thresholds.max_time_gap_s
+    elif any(value is None for value in individual_thresholds):
+        raise TypeError(
+            "provide thresholds or all of max_distance_m, min_stop_duration_s, "
+            "and max_time_gap_s"
+        )
+    else:
+        max_distance_m = _positive_number(max_distance_m, "max_distance_m")
+        min_stop_duration_s = _positive_number(
+            min_stop_duration_s, "min_stop_duration_s", allow_zero=True
+        )
+        max_time_gap_s = _positive_number(max_time_gap_s, "max_time_gap_s")
+    assert max_distance_m is not None
+    assert min_stop_duration_s is not None
+    assert max_time_gap_s is not None
     source_timezone = _validate_timezone(source_timezone, argument="source_timezone")
 
     source_relation = dataset._relation
@@ -236,8 +274,12 @@ def cluster_stops(
                     candidate["device"],
                     _utc_datetime(candidate["start_time"]),
                     _utc_datetime(candidate["last_time"]),
-                    candidate["latitude_sum"] / candidate["ping_count"],
-                    candidate["longitude_sum"] / candidate["ping_count"],
+                    *_spherical_centroid(
+                        candidate["x_sum"],
+                        candidate["y_sum"],
+                        candidate["z_sum"],
+                        (candidate["anchor_latitude"], candidate["anchor_longitude"]),
+                    ),
                     candidate["ping_count"],
                     duration,
                 )
@@ -248,14 +290,17 @@ def cluster_stops(
 
     def start_candidate(device_value: Any, observed_at: datetime, lat: float, lon: float) -> dict[str, Any]:
         """Start a stop candidate at one ping."""
+        latitude_radians = math.radians(lat)
+        longitude_radians = math.radians(lon)
         return {
             "device": device_value,
             "start_time": observed_at,
             "last_time": observed_at,
             "anchor_latitude": lat,
             "anchor_longitude": lon,
-            "latitude_sum": lat,
-            "longitude_sum": lon,
+            "x_sum": math.cos(latitude_radians) * math.cos(longitude_radians),
+            "y_sum": math.cos(latitude_radians) * math.sin(longitude_radians),
+            "z_sum": math.sin(latitude_radians),
             "ping_count": 1,
         }
 
@@ -290,8 +335,11 @@ def cluster_stops(
                     candidate = start_candidate(device_value, observed_at, lat, lon)
                 else:
                     candidate["last_time"] = observed_at
-                    candidate["latitude_sum"] += lat
-                    candidate["longitude_sum"] += lon
+                    latitude_radians = math.radians(lat)
+                    longitude_radians = math.radians(lon)
+                    candidate["x_sum"] += math.cos(latitude_radians) * math.cos(longitude_radians)
+                    candidate["y_sum"] += math.cos(latitude_radians) * math.sin(longitude_radians)
+                    candidate["z_sum"] += math.sin(latitude_radians)
                     candidate["ping_count"] += 1
         finish_candidate()
         _write_rows(dataset._connection, table_name, output_rows, 8)
@@ -301,7 +349,12 @@ def cluster_stops(
     return _result_dataset(dataset, table_name)
 
 
-def form_trips(stops: Dataset, *, max_time_gap_s: float) -> Dataset:
+def form_trips(
+    stops: Dataset,
+    *,
+    max_time_gap_s: float | None = None,
+    thresholds: MobilityThresholds | None = None,
+) -> Dataset:
     """Form trip summaries between consecutive stops for each device.
 
     Consecutive stop rows are paired per ``device_id`` in start-time order. A
@@ -312,6 +365,9 @@ def form_trips(stops: Dataset, *, max_time_gap_s: float) -> Dataset:
         stops: Stop-summary Dataset returned by :meth:`Dataset.cluster_stops`.
         max_time_gap_s: Maximum allowed time between consecutive stops, in
             seconds. Larger gaps do not form a trip.
+        thresholds: Optional reusable threshold set. Its
+            ``trip_max_time_gap_s`` must be configured. Supply this or
+            ``max_time_gap_s``.
 
     Returns:
         A Dataset with one row per formed trip and columns ``trip_id``,
@@ -328,7 +384,18 @@ def form_trips(stops: Dataset, *, max_time_gap_s: float) -> Dataset:
 
     if not isinstance(stops, Dataset):
         raise TypeError("stops must be an opengeomove.Dataset")
-    max_time_gap_s = _positive_number(max_time_gap_s, "max_time_gap_s")
+    if thresholds is not None:
+        if not isinstance(thresholds, MobilityThresholds):
+            raise TypeError("thresholds must be a MobilityThresholds instance")
+        if max_time_gap_s is not None:
+            raise ValueError("supply thresholds or max_time_gap_s, not both")
+        if thresholds.trip_max_time_gap_s is None:
+            raise ValueError("thresholds.trip_max_time_gap_s must be set to form trips")
+        max_time_gap_s = thresholds.trip_max_time_gap_s
+    elif max_time_gap_s is None:
+        raise TypeError("provide max_time_gap_s or thresholds")
+    else:
+        max_time_gap_s = _positive_number(max_time_gap_s, "max_time_gap_s")
     required = (
         "cluster_id",
         "device_id",
