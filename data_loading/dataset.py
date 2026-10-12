@@ -164,6 +164,8 @@ class Dataset(EDAAccessor, MobilityAccessor):
             data_format=self._format,
         )
         derived._filters = self._filters
+        if hasattr(self, "_stop_merge_distance_m"):
+            derived._stop_merge_distance_m = self._stop_merge_distance_m
         return derived
 
     def __str__(self) -> str:

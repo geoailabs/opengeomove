@@ -86,6 +86,71 @@ class MobilityTests(unittest.TestCase):
 
         self.assertEqual(trips.shape[0], 0)
 
+    def test_home_work_classification_uses_local_windows_and_evidence(self) -> None:
+        """Identify recurring home and weekday work locations from stop rows."""
+        path = Path(self._temporary_directory.name) / "recurring-stops.parquet"
+        connection = duckdb.connect()
+        connection.execute(
+            """COPY (SELECT * FROM (VALUES
+                (1, 'a', TIMESTAMPTZ '2025-01-06 15:30:00+00', TIMESTAMPTZ '2025-01-06 16:00:00+00', 28.61000::DOUBLE, 77.20000::DOUBLE),
+                (2, 'a', TIMESTAMPTZ '2025-01-07 04:30:00+00', TIMESTAMPTZ '2025-01-07 05:00:00+00', 28.62000::DOUBLE, 77.21000::DOUBLE),
+                (3, 'a', TIMESTAMPTZ '2025-01-07 15:30:00+00', TIMESTAMPTZ '2025-01-07 16:00:00+00', 28.61001::DOUBLE, 77.20001::DOUBLE),
+                (4, 'a', TIMESTAMPTZ '2025-01-08 04:30:00+00', TIMESTAMPTZ '2025-01-08 05:00:00+00', 28.62001::DOUBLE, 77.21001::DOUBLE),
+                (5, 'a', TIMESTAMPTZ '2025-01-08 15:30:00+00', TIMESTAMPTZ '2025-01-08 16:00:00+00', 28.61002::DOUBLE, 77.20002::DOUBLE),
+                (6, 'a', TIMESTAMPTZ '2025-01-09 04:30:00+00', TIMESTAMPTZ '2025-01-09 05:00:00+00', 28.62002::DOUBLE, 77.21002::DOUBLE)
+            ) AS stops(cluster_id, device_id, start_time, end_time, latitude, longitude))
+            TO ? (FORMAT PARQUET)""",
+            [str(path)],
+        )
+        connection.close()
+        stops = ogm.open(path)
+        stops._stop_merge_distance_m = 100
+        try:
+            classified = stops.classify_home_work(
+                timezone_name="Asia/Kolkata",
+                min_visits=3,
+                min_distinct_days=3,
+                min_total_dwell_s=5_400,
+            )
+
+            rows = {row[1]: row for row in classified.rows}
+            self.assertEqual(set(rows), {"home", "work"})
+            self.assertEqual(rows["home"][4], "classified")
+            self.assertEqual(rows["work"][4], "classified")
+            self.assertEqual(rows["home"][6:8], (3, 3))
+            self.assertEqual(rows["work"][6:8], (3, 3))
+            self.assertAlmostEqual(rows["home"][2], 28.61001, places=4)
+            self.assertAlmostEqual(rows["work"][2], 28.62001, places=4)
+            self.assertEqual(stops.shape, (6, 6))
+        finally:
+            stops._connection.close()
+
+    def test_home_work_uncertain_for_tied_or_weak_candidates(self) -> None:
+        """Return uncertain candidates when evidence minima are not met."""
+        stops = self._stops()
+        classified = stops.classify_home_work(
+            timezone_name="UTC",
+            min_visits=5,
+            min_distinct_days=2,
+            min_total_dwell_s=600,
+            merge_nearby=False,
+        )
+
+        rows = list(classified.rows)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row[4] == "uncertain" for row in rows))
+
+        tied = stops.classify_home_work(
+            timezone_name="UTC",
+            min_visits=1,
+            min_distinct_days=1,
+            min_total_dwell_s=300,
+            merge_nearby=False,
+        )
+        by_device_role = {(row[0], row[1]): row for row in tied.rows}
+        self.assertEqual(by_device_role[("a", "home")][4], "uncertain")
+        self.assertEqual(by_device_role[("b", "home")][4], "classified")
+
     def test_reusable_thresholds_apply_to_stops_and_trips(self) -> None:
         """Use one immutable threshold set for both analysis stages."""
         thresholds = ogm.MobilityThresholds(

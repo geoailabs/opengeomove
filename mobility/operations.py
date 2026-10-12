@@ -346,7 +346,9 @@ def cluster_stops(
     except Exception:
         dataset._connection.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
         raise
-    return _result_dataset(dataset, table_name)
+    result = _result_dataset(dataset, table_name)
+    result._stop_merge_distance_m = max_distance_m
+    return result
 
 
 def form_trips(
