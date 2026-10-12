@@ -9,12 +9,13 @@ from typing import Any, Iterator
 import duckdb
 
 from opengeomove.eda.accessor import EDAAccessor
+from opengeomove.mobility.accessor import MobilityAccessor
 
 _DISPLAY_MAX_ROWS = 5
 _ITER_BATCH_SIZE = 1024
 
 
-class Dataset(EDAAccessor):
+class Dataset(EDAAccessor, MobilityAccessor):
     """A read-only, lazy view over a source file scanned by DuckDB.
 
     Args:

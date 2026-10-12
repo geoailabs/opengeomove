@@ -184,6 +184,7 @@ class GPSPlot:
         lon = _quote_identifier(self.longitude_col)
         alias = "_ogm_gps_plot_source"
         sql = (
+            "SELECT latitude, longitude FROM ("
             f"SELECT TRY_CAST({lat} AS DOUBLE) AS latitude, "
             f"TRY_CAST({lon} AS DOUBLE) AS longitude FROM {alias} "
             f"WHERE TRY_CAST({lat} AS DOUBLE) IS NOT NULL "
@@ -192,7 +193,7 @@ class GPSPlot:
             f"AND isfinite(TRY_CAST({lon} AS DOUBLE)) "
             f"AND TRY_CAST({lat} AS DOUBLE) BETWEEN -90 AND 90 "
             f"AND TRY_CAST({lon} AS DOUBLE) BETWEEN -180 AND 180 "
-            f"USING SAMPLE reservoir({self.sampling} ROWS)"
+            f") AS valid_coordinates USING SAMPLE reservoir({self.sampling} ROWS)"
         )
         relation = self.dataset._relation.query(alias, sql)
         return [(float(latitude), float(longitude)) for latitude, longitude in relation.fetchall()]
