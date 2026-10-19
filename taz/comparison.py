@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from io import BytesIO
 import html
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -50,8 +51,9 @@ class TAZComparison:
         Returns:
             The report file path. Beside it, the method writes reference and
             generated GeoJSON, per-reference-zone comparison GeoJSON, global
-            metrics JSON, and a manifest. The report embeds its map images and
-            metrics, so it does not fetch remote basemap tiles when opened.
+            metrics JSON, an interactive overlay map, and a manifest. The
+            overlay map uses Esri imagery tiles and needs internet access when
+            viewed; the report also embeds static map images.
         """
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +64,14 @@ class TAZComparison:
 
             raise TAZDependencyError(
                 "TAZ report map rendering requires matplotlib"
+            ) from exc
+        try:
+            import plotly.graph_objects as go
+        except ImportError as exc:
+            from opengeomove.taz.exceptions import TAZDependencyError
+
+            raise TAZDependencyError(
+                "Interactive TAZ maps require plotly"
             ) from exc
         figure, axes = plt.subplots(2, 2, figsize=(14, 12))
         self.matches.plot(ax=axes[0, 0], color="#27a8c7", edgecolor="white", linewidth=0.15)
@@ -107,16 +117,95 @@ class TAZComparison:
             json.dumps({"report": destination.name, "crs": str(self.matches.crs)}, indent=2),
             encoding="utf-8",
         )
+        actual_wgs84 = self.matches.to_crs("EPSG:4326").reset_index(drop=True)
+        generated_wgs84 = self.generated.to_crs("EPSG:4326").reset_index(drop=True)
+
+        def to_feature_collection(frame: gpd.GeoDataFrame, id_column: str) -> dict[str, Any]:
+            """Convert polygon rows to an ID-keyed GeoJSON feature collection."""
+            from shapely.geometry import mapping
+
+            features = []
+            for _, row in frame.iterrows():
+                zone_id = str(row[id_column])
+                features.append({
+                    "type": "Feature",
+                    "id": zone_id,
+                    "properties": {id_column: zone_id},
+                    "geometry": mapping(row.geometry),
+                })
+            return {"type": "FeatureCollection", "features": features}
+
+        actual_id_column = "actual_taz_id"
+        generated_id_column = "taz_id" if "taz_id" in generated_wgs84 else generated_wgs84.columns[0]
+        actual_geojson = to_feature_collection(actual_wgs84, actual_id_column)
+        generated_geojson = to_feature_collection(generated_wgs84, generated_id_column)
+        figure = go.Figure()
+        figure.add_trace(go.Choroplethmapbox(
+            name=f"Reference zones ({len(actual_wgs84):,})",
+            geojson=actual_geojson,
+            locations=actual_wgs84[actual_id_column].astype(str),
+            z=[1] * len(actual_wgs84),
+            featureidkey="id",
+            colorscale=[[0, "#19d3f3"], [1, "#19d3f3"]],
+            showscale=False,
+            marker={"opacity": 0.14, "line": {"color": "#19d3f3", "width": 0.6}},
+            customdata=actual_wgs84[actual_id_column].astype(str),
+            hovertemplate="Reference TAZ: %{customdata}<extra></extra>",
+        ))
+        figure.add_trace(go.Choroplethmapbox(
+            name=f"Generated zones ({len(generated_wgs84):,})",
+            geojson=generated_geojson,
+            locations=generated_wgs84[generated_id_column].astype(str),
+            z=[1] * len(generated_wgs84),
+            featureidkey="id",
+            colorscale=[[0, "#ff5a36"], [1, "#ff5a36"]],
+            showscale=False,
+            marker={"opacity": 0.14, "line": {"color": "#ff5a36", "width": 0.6}},
+            customdata=generated_wgs84[generated_id_column].astype(str),
+            hovertemplate="Generated TAZ: %{customdata}<extra></extra>",
+        ))
+        minx, miny, maxx, maxy = actual_wgs84.total_bounds
+        span = max(maxx - minx, maxy - miny, 0.001)
+        figure.update_layout(
+            title="Reference and generated TAZ overlay",
+            mapbox={
+                "style": "white-bg",
+                "center": {"lon": (minx + maxx) / 2, "lat": (miny + maxy) / 2},
+                "zoom": max(3, min(18, 12 - math.log(span, 2))),
+                "layers": [{
+                    "sourcetype": "raster",
+                    "source": [
+                        "https://server.arcgisonline.com/ArcGIS/rest/services/"
+                        "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                    ],
+                    "below": "traces",
+                }],
+            },
+            mapbox_uirevision="opengeomove-taz-comparison",
+            legend={"orientation": "h", "y": 1.02, "x": 0},
+            margin={"l": 0, "r": 0, "t": 50, "b": 0},
+            height=760,
+        )
+        overlay_path = destination.with_name("comparison_overlay.html")
+        figure.write_html(
+            overlay_path,
+            include_plotlyjs=True,
+            full_html=True,
+            config={"displaylogo": False, "responsive": True},
+        )
         destination.write_text(
             "<!doctype html><meta charset='utf-8'>"
             f"<title>{html.escape(title)}</title><h1>{html.escape(title)}</h1>"
             "<p>Each reference zone is paired with the generated zone having its largest positive-area overlap.</p>"
             f"<img alt='TAZ comparison maps' style='max-width:100%' src='data:image/png;base64,{encoded_map}'>"
+            f"<h2>Interactive zone overlay</h2><iframe title='TAZ overlay' "
+            f"style='width:100%;height:760px;border:1px solid #ccd6e0' src='{overlay_path.name}'></iframe>"
             f"<h2>Aggregate metrics</h2>{metrics}"
             f"<h2>Twenty lowest-overlap reference zones</h2>{table}"
             f"<h2>Data files</h2><ul><li>{reference_path.name}</li>"
             f"<li>{generated_path.name}</li><li>{matches_path.name}</li>"
-            f"<li>{metrics_path.name}</li><li>{manifest_path.name}</li></ul>",
+            f"<li>{metrics_path.name}</li><li>{manifest_path.name}</li>"
+            f"<li>{overlay_path.name}</li></ul>",
             encoding="utf-8",
         )
         return destination

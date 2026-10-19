@@ -93,6 +93,8 @@ class TAZTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = comparison.write_report(Path(directory) / "comparison.html")
             self.assertTrue(report.is_file())
+            self.assertTrue((Path(directory) / "comparison_overlay.html").is_file())
+            self.assertTrue((Path(directory) / "taz_matches.geojson").is_file())
 
     def test_invalid_area_settings_are_rejected(self) -> None:
         """Reject contradictory minimum and maximum area constraints."""
