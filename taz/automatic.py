@@ -37,8 +37,12 @@ class AutomaticTAZConfig:
 
     This configuration controls road filtering, corridor buffers, recursive
     split sizes, raster bands, geometry cleanup, and explicit output paths.
-    Outputs are written only when :func:`create_automatic_taz` is called.
-    Plot output supports PNG, PDF, and self-contained HTML previews.
+    Set ``download_google_buildings=True`` to fetch public Google 2.5D tiles
+    for ``building_data_year`` (2016–2023; default 2023) when
+    ``building_raster_path`` is not supplied. Downloads are cached under
+    ``building_cache_dir`` or ``output_dir/building_rasters``. Outputs are
+    written only when :func:`create_automatic_taz` is called. Plot output
+    supports PNG, PDF, and self-contained HTML previews.
     """
 
     city_name: str = "city"
@@ -46,6 +50,9 @@ class AutomaticTAZConfig:
     network_type: str = "drive"
     osm_cache_path: Path | None = None
     building_raster_path: Path | None = None
+    download_google_buildings: bool = False
+    building_data_year: int = 2023
+    building_cache_dir: Path | None = None
     building_count_band: int = 1
     building_height_band: int = 2
     building_presence_band: int = 3
@@ -101,6 +108,14 @@ class AutomaticTAZConfig:
         """Validate raster bands, area targets, output formats, and split limits."""
         if not isinstance(self.city_name, str) or not self.city_name.strip():
             raise ValueError("city_name must be a non-empty string")
+        if not isinstance(self.download_google_buildings, bool):
+            raise TypeError("download_google_buildings must be a bool")
+        if (
+            isinstance(self.building_data_year, bool)
+            or not isinstance(self.building_data_year, int)
+            or self.building_data_year not in range(2016, 2024)
+        ):
+            raise ValueError("building_data_year must be an integer from 2016 through 2023")
         if not 0 <= self.building_presence_threshold <= 1:
             raise ValueError("building_presence_threshold must be between 0 and 1")
         if min(
@@ -1072,8 +1087,10 @@ def create_automatic_taz(
     GeoPandas (including the KML workflow in the reference bundle). ``graph``
     may be an OSMnx graph, a pickled OSMnx graph, a vector path, or a road-edge
     GeoDataFrame. If omitted, OSM roads are downloaded and cached in the
-    configured output directory. A building raster or tile directory enables
-    building-aware recursive splits.
+    configured output directory. A local building raster or tile directory
+    enables building-aware recursive splits. Alternatively,
+    ``download_google_buildings=True`` downloads intersecting Google 2.5D
+    tiles for the configured year into a reusable local cache.
 
     Args:
         boundary: Polygonal study boundary with a declared CRS.
@@ -1093,6 +1110,8 @@ def create_automatic_taz(
         TAZDependencyError: If an optional road, raster, or clustering
             dependency is unavailable.
         TAZGeometryError: If input or generated geometry is unusable.
+        FileNotFoundError: If Google publishes no matching tiles for the
+            configured boundary and year.
     """
     if config is not None and not isinstance(config, AutomaticTAZConfig):
         raise TypeError("config must be an AutomaticTAZConfig instance")
@@ -1118,6 +1137,36 @@ def create_automatic_taz(
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     plots = cfg.output_dir / "plots"
     city = _load_boundary(boundary)
+    building_source = "local" if cfg.building_raster_path is not None else None
+    building_download_info = None
+    if cfg.download_google_buildings and cfg.building_raster_path is None:
+        from opengeomove.data_loading.google_buildings import (
+            download_open_buildings_25d,
+        )
+
+        cache_root = (
+            Path(cfg.building_cache_dir)
+            if cfg.building_cache_dir is not None
+            else cfg.output_dir / "building_rasters"
+        )
+        raster_cache = cache_root / str(cfg.building_data_year)
+        downloaded_tiles = download_open_buildings_25d(
+            city, cache_root, year=cfg.building_data_year
+        )
+        cfg.building_raster_path = raster_cache
+        building_source = "google_open_buildings_2_5d"
+        building_download_info = {
+            "source": building_source,
+            "year": cfg.building_data_year,
+            "tile_paths": [str(path) for path in downloaded_tiles],
+            "cache_dir": str(raster_cache),
+            "license_options": ["CC-BY-4.0", "ODbL-1.0"],
+            "source_url": "https://sites.research.google/gr/open-buildings/temporal",
+        }
+        logging.info(
+            "Using %d cached Google 2.5D raster tile(s) from %s",
+            len(downloaded_tiles), raster_cache,
+        )
     metric_crs = city.estimate_utm_crs()
     if metric_crs is None:
         raise TAZGeometryError("Could not estimate a metric CRS for the boundary")
@@ -1232,6 +1281,13 @@ def create_automatic_taz(
         "output_dir": str(cfg.output_dir),
         "status_counts": final.status.value_counts().to_dict(),
         "building_raster_count": len(_building_raster_paths(cfg.building_raster_path)),
+        "building_data_source": building_source,
+        "building_data_year": (
+            cfg.building_data_year
+            if building_source == "google_open_buildings_2_5d"
+            else None
+        ),
+        "building_download": building_download_info,
         **cfg.metadata,
     }
     return TAZFrame(final, metadata)

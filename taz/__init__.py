@@ -11,6 +11,7 @@ from opengeomove.taz.create import TAZBuilder, create, create_taz
 from opengeomove.taz.exceptions import TAZDependencyError, TAZError, TAZGeometryError
 from opengeomove.taz.models import StudyArea, TAZFrame, TAZReport
 from opengeomove.taz.population import PopulationSource, attach_population, population_cells
+from opengeomove.data_loading.google_buildings import download_open_buildings_25d
 
 __all__ = [
     "AutomaticTAZConfig",
@@ -29,5 +30,6 @@ __all__ = [
     "create",
     "create_automatic_taz",
     "create_taz",
+    "download_open_buildings_25d",
     "population_cells",
 ]

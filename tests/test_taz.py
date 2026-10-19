@@ -100,6 +100,115 @@ class TAZTests(unittest.TestCase):
         """Reject contradictory minimum and maximum area constraints."""
         with self.assertRaises(ValueError):
             ogm.taz.TAZConfig(min_area_km2=2, max_area_km2=1)
+        with self.assertRaises(ValueError):
+            ogm.taz.AutomaticTAZConfig(building_data_year=2024)
+
+    def test_google_building_downloader_selects_intersecting_tiles_and_caches(self) -> None:
+        """Download only boundary-intersecting public tiles and reuse the cache."""
+        import json
+        from opengeomove.data_loading import google_buildings
+
+        class FakeBlob:
+            """Represent one manifest or public raster object in tests."""
+
+            def __init__(self, name, payload=None):
+                """Store blob identity, manifest payload, and download count."""
+                self.name = name
+                self.payload = payload
+                self.download_count = 0
+
+            def download_as_bytes(self):
+                """Serialize the configured manifest payload."""
+                return json.dumps(self.payload).encode("utf-8")
+
+            def download_to_filename(self, filename, timeout):
+                """Write a small placeholder tile without network access."""
+                self.download_count += 1
+                Path(filename).write_bytes(b"fake-cog")
+
+        tile_manifest = {
+            "uriPrefix": "gs://open-buildings-temporal-data/v1/2023/",
+            "tilesets": [{
+                "crs": "EPSG:4326",
+                "sources": [
+                    {
+                        "affineTransform": {
+                            "translateX": 77.0,
+                            "translateY": 29.0,
+                            "scaleX": 1.0,
+                            "scaleY": -1.0,
+                        },
+                        "dimensions": {"width": 1, "height": 1},
+                        "uris": ["intersecting.tif"],
+                    },
+                    {
+                        "affineTransform": {
+                            "translateX": 0.0,
+                            "translateY": 1.0,
+                            "scaleX": 1.0,
+                            "scaleY": -1.0,
+                        },
+                        "dimensions": {"width": 1, "height": 1},
+                        "uris": ["outside.tif"],
+                    },
+                ],
+            }],
+        }
+        manifest = FakeBlob("v1/manifests/fake_2023_manifest.json", tile_manifest)
+
+        class FakeBucket:
+            """Provide fake GCS raster blobs."""
+
+            def __init__(self):
+                """Initialize the in-memory blob map."""
+                self.tiles = {}
+
+            def blob(self, name):
+                """Return a stable fake object for a GCS object path."""
+                return self.tiles.setdefault(name, FakeBlob(name))
+
+        class FakeStorageClient:
+            """Provide fake GCS manifest and bucket lookups."""
+
+            def __init__(self):
+                """Create a fresh fake bucket for each test."""
+                self.fake_bucket = FakeBucket()
+
+            def list_blobs(self, bucket, prefix):
+                """Return the test manifest for any requested prefix."""
+                self.requested_prefix = prefix
+                return [manifest]
+
+            def bucket(self, name):
+                """Return the configured fake bucket."""
+                return self.fake_bucket
+
+        fake_client = FakeStorageClient()
+        boundary = gpd.GeoDataFrame(
+            geometry=[self.boundary], crs="EPSG:4326"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(google_buildings, "_new_storage_client", return_value=fake_client),
+                patch.object(google_buildings, "_s2_covering_tokens", return_value=["fake"]),
+            ):
+                first = google_buildings.download_open_buildings_25d(
+                    boundary, directory, year=2023
+                )
+                second = google_buildings.download_open_buildings_25d(
+                    boundary, directory, year=2023
+                )
+
+            self.assertEqual(first, second)
+            self.assertEqual(len(first), 1)
+            self.assertTrue(first[0].is_file())
+            self.assertEqual(
+                fake_client.fake_bucket.tiles[
+                    "v1/2023/intersecting.tif"
+                ].download_count,
+                1,
+            )
+            self.assertTrue((first[0].parent / "download_manifest.json").is_file())
 
     def test_raster_population_reads_only_cells_in_the_boundary(self) -> None:
         """Crop population raster reads to the supplied study-area extent."""
@@ -217,12 +326,26 @@ class TAZTests(unittest.TestCase):
             return empty, empty.copy()
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(automatic, "_centerlines", side_effect=no_centerlines):
+            def fake_google_download(boundary, cache_dir, *, year):
+                """Create a placeholder cache entry without network access."""
+                path = Path(cache_dir) / str(year) / "tile.tif"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"test placeholder")
+                return [path]
+
+            with (
+                patch.object(automatic, "_centerlines", side_effect=no_centerlines),
+                patch(
+                    "opengeomove.data_loading.google_buildings.download_open_buildings_25d",
+                    side_effect=fake_google_download,
+                ),
+            ):
                 zones = ogm.taz.create_automatic_taz(
                     boundary,
                     roads,
                     config=ogm.taz.AutomaticTAZConfig(
                         output_dir=Path(directory),
+                        download_google_buildings=True,
                         fetch_railways_and_waterways=False,
                         save_plots=False,
                         barrier_min_area_km2=0.001,
@@ -233,6 +356,11 @@ class TAZTests(unittest.TestCase):
                 )
 
             self.assertEqual(len(zones), 1)
+            self.assertEqual(
+                zones.metadata["building_data_source"],
+                "google_open_buildings_2_5d",
+            )
+            self.assertEqual(zones.metadata["building_data_year"], 2023)
             self.assertTrue(
                 (Path(directory) / "17_final_tazs_with_status.geojson").is_file()
             )
