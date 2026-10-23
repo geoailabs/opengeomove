@@ -29,13 +29,12 @@ _SUPPORTED_YEARS = range(2016, 2024)
 def _new_storage_client():
     """Create an anonymous client for Google's public Cloud Storage bucket."""
     try:
-        from google.auth.credentials import AnonymousCredentials
         from google.cloud import storage
     except ImportError as exc:
         raise ImportError(
             "Google 2.5D downloads require google-auth and google-cloud-storage"
         ) from exc
-    return storage.Client(credentials=AnonymousCredentials())
+    return storage.Client.create_anonymous_client()
 
 
 def _boundary_geometry(boundary: gpd.GeoDataFrame | Any) -> Any:

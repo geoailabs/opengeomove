@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import geopandas as gpd
 import numpy as np
-from shapely.geometry import LineString, box
+from shapely.geometry import GeometryCollection, LineString, Polygon, box
 
 import opengeomove as ogm
 
@@ -306,6 +306,68 @@ class TAZTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertAlmostEqual(merged.area_km2.iloc[0], 1.1)
         self.assertEqual(len(audit), 1)
+
+    def test_final_undersized_merge_skips_null_geometry_rows(self) -> None:
+        """Ignore empty artifacts while merging valid final zones."""
+        from opengeomove.taz import automatic
+
+        zones = gpd.GeoDataFrame(
+            geometry=[box(0, 0, 100, 100), box(100, 0, 1100, 1000), None],
+            crs="EPSG:32643",
+        )
+        merged, audit = automatic._merge_final_undersized(
+            zones, minimum=0.5, crs=zones.crs
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(merged.geometry.notna().all())
+        self.assertAlmostEqual(merged.area_km2.iloc[0], 1.01)
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(
+            automatic._shared_boundary_length(
+                type("GeometryWithNullBoundary", (), {
+                    "is_empty": False,
+                    "boundary": None,
+                })(),
+                zones.geometry.iloc[0].boundary,
+            ),
+            0.0,
+        )
+
+    def test_automatic_partition_repairs_invalid_polygons_and_checks_coverage(self) -> None:
+        """Repair self-intersections and reject gaps in a TAZ partition."""
+        from opengeomove.taz import automatic
+
+        bow_tie = Polygon([(0, 0), (1000, 1000), (0, 1000), (1000, 0), (0, 0)])
+        repaired = automatic._normalize_polygon_frame(
+            gpd.GeoDataFrame(geometry=[bow_tie], crs="EPSG:32643"),
+            stage="test partition",
+        )
+        self.assertTrue(repaired.geometry.is_valid.all())
+        self.assertGreater(repaired.area_km2.iloc[0], 0)
+
+        mixed = automatic._normalize_polygon_frame(
+            gpd.GeoDataFrame(
+                geometry=[GeometryCollection([box(0, 0, 10, 10), LineString([(0, 0), (10, 10)])])],
+                crs="EPSG:32643",
+            ),
+            stage="mixed test partition",
+        )
+        self.assertEqual(mixed.geometry.iloc[0].geom_type, "Polygon")
+
+        boundary = box(0, 0, 1000, 1000)
+        complete = gpd.GeoDataFrame(
+            geometry=[box(0, 0, 500, 1000), box(500, 0, 1000, 1000)],
+            crs="EPSG:32643",
+        )
+        automatic._validate_partition(complete, boundary, stage="complete test")
+
+        incomplete = complete.copy()
+        incomplete.loc[1, "geometry"] = box(600, 0, 1000, 1000)
+        with self.assertRaisesRegex(ogm.taz.TAZGeometryError, "uncovered"):
+            automatic._validate_partition(
+                incomplete, boundary, stage="incomplete test"
+            )
 
     def test_automatic_taz_pipeline_handles_no_recursive_dividers(self) -> None:
         """Create/export a coarse partition when zones already meet size goals."""

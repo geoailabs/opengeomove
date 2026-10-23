@@ -178,6 +178,99 @@ def _area(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return result
 
 
+def _valid_polygonal(geometry: Any):
+    """Return the valid polygonal portion of one geometry.
+
+    Args:
+        geometry: A polygonal Shapely geometry, possibly invalid.
+
+    Returns:
+        A valid Polygon or MultiPolygon, or ``None`` when no polygonal area
+        remains after repair.
+    """
+    if geometry is None or geometry.is_empty:
+        return None
+    repaired = make_valid(geometry)
+    polygons = _polygons(repaired)
+    if not polygons:
+        return None
+    polygonal = unary_union(polygons)
+    if not polygonal.is_valid:
+        polygonal = make_valid(polygonal)
+        polygons = _polygons(polygonal)
+        polygonal = unary_union(polygons) if polygons else None
+    return polygonal if polygonal is not None and not polygonal.is_empty else None
+
+
+def _normalize_polygon_frame(
+    frame: gpd.GeoDataFrame, *, stage: str
+) -> gpd.GeoDataFrame:
+    """Repair invalid polygon rows while retaining their attributes.
+
+    Args:
+        frame: GeoDataFrame whose active geometry must be polygonal.
+        stage: Human-readable stage name included in logs and exceptions.
+
+    Returns:
+        A copy with valid Polygon or MultiPolygon geometries and refreshed
+        ``area_km2`` values.
+
+    Raises:
+        TAZGeometryError: If a row has no polygonal area after repair.
+    """
+    result = frame.copy()
+    needs_normalization = (
+        result.geometry.isna()
+        | result.geometry.is_empty
+        | ~result.geometry.is_valid
+        | ~result.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    )
+    if needs_normalization.any():
+        logging.warning(
+            "Normalizing %d invalid, empty, or mixed polygon row(s) at %s",
+            int(needs_normalization.sum()), stage,
+        )
+        result.geometry = result.geometry.map(_valid_polygonal)
+    missing = result.geometry.isna() | result.geometry.is_empty
+    if missing.any():
+        raise TAZGeometryError(
+            f"{stage} contains {int(missing.sum())} row(s) without polygonal area"
+        )
+    if (~result.geometry.is_valid).any():
+        raise TAZGeometryError(f"{stage} still contains invalid polygon geometry")
+    if not result.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).all():
+        raise TAZGeometryError(f"{stage} still contains non-polygon geometry")
+    return _area(result)
+
+
+def _validate_partition(
+    zones: gpd.GeoDataFrame, boundary: Any, *, stage: str
+) -> None:
+    """Validate non-overlap and complete boundary coverage in metric units.
+
+    Args:
+        zones: Valid polygon zones in the same metric CRS as ``boundary``.
+        boundary: Polygonal study-area geometry.
+        stage: Human-readable stage name included in exceptions.
+
+    Raises:
+        TAZGeometryError: If zones overlap, leave a material gap, or extend
+            materially outside the study-area boundary.
+    """
+    zone_union = zones.geometry.union_all()
+    total_area = float(zones.geometry.area.sum())
+    tolerance = max(float(boundary.area), 1.0) * 1e-6
+    overlap = max(0.0, total_area - float(zone_union.area))
+    uncovered = float(boundary.difference(zone_union).area)
+    outside = float(zone_union.difference(boundary).area)
+    if overlap > tolerance or uncovered > tolerance or outside > tolerance:
+        raise TAZGeometryError(
+            f"{stage} is not a valid study-area partition: "
+            f"overlap={overlap:.3f} m2, uncovered={uncovered:.3f} m2, "
+            f"outside={outside:.3f} m2, tolerance={tolerance:.3f} m2"
+        )
+
+
 def _lines(geometry: Any) -> list[LineString]:
     """Recursively collect line components from mixed Shapely geometry."""
     if geometry is None or geometry.is_empty:
@@ -375,13 +468,19 @@ def _aligned_divider(divider: LineString, roads: gpd.GeoDataFrame, cfg):
 
 def _split_all(parent: Polygon, divider: LineString, minimum: float):
     """Split a parent polygon and return polygonal children above a size floor."""
+    parent = _valid_polygonal(parent)
+    if parent is None:
+        return []
     try:
         pieces = split(parent, divider).geoms
     except Exception:
         return []
     children = []
     for piece in pieces:
-        children.extend([poly for poly in _polygons(piece.intersection(parent)) if poly.area > minimum])
+        repaired = _valid_polygonal(piece.intersection(parent))
+        children.extend([
+            poly for poly in _polygons(repaired) if poly.area > minimum
+        ])
     return children
 
 
@@ -864,9 +963,26 @@ def _recursive_split(parent, roads, crs, cfg, coarse_id, depth=0):
     return records, dividers
 
 
+def _shared_boundary_length(geometry, reference_boundary) -> float:
+    """Return shared boundary length, treating null/empty boundaries as zero."""
+    if geometry is None or reference_boundary is None or geometry.is_empty:
+        return 0.0
+    boundary = geometry.boundary
+    if boundary is None or boundary.is_empty or reference_boundary.is_empty:
+        return 0.0
+    return float(boundary.intersection(reference_boundary).length)
+
+
 def _merge_final_undersized(zones, minimum, crs):
     """Absorb every final sub-minimum zone after recursive splitting."""
     working = _area(zones).reset_index(drop=True)
+    invalid_geometry = working.geometry.isna() | working.geometry.is_empty
+    if invalid_geometry.any():
+        logging.warning(
+            "Dropping %d final TAZ row(s) with null or empty geometry before merging",
+            int(invalid_geometry.sum()),
+        )
+        working = working.loc[~invalid_geometry].reset_index(drop=True)
     audit = []
     while len(working) > 1:
         undersized = working[working.area_km2 < minimum]
@@ -875,10 +991,14 @@ def _merge_final_undersized(zones, minimum, crs):
         source = undersized.area_km2.idxmin()
         source_geom = working.loc[source, "geometry"]
         candidates = working.drop(index=source).copy()
+        candidates = candidates[
+            candidates.geometry.notna() & ~candidates.geometry.is_empty
+        ]
         touching = candidates[candidates.geometry.touches(source_geom)].copy()
         if not touching.empty:
+            source_boundary = source_geom.boundary
             touching["shared_boundary_m"] = touching.geometry.apply(
-                lambda geom: geom.boundary.intersection(source_geom.boundary).length
+                lambda geom: _shared_boundary_length(geom, source_boundary)
             )
             touching = touching[touching.shared_boundary_m > 0]
         if touching.empty:
@@ -1216,6 +1336,9 @@ def create_automatic_taz(
     barrier_lines = gpd.GeoDataFrame(pd.concat([road_barriers[["geometry"]], natural_barriers[["geometry"]]], ignore_index=True), geometry="geometry", crs=metric_crs)
     first_coarse, first_dangles = _polygonize(barrier_lines, city_geom, metric_crs)
     first_coarse = _merge_small(first_coarse, cfg.coarse_min_area_km2)
+    first_coarse = _normalize_polygon_frame(
+        first_coarse, stage="initial coarse partition"
+    )
     boundary_gdf = _gdf(list(first_coarse.boundary), metric_crs)
     coarse_corridors, coarse_centerlines = _centerlines(boundary_gdf, cfg.coarse_boundary_buffer_m, cfg)
     cleaned_centerlines = _prune_terminal_branches(coarse_centerlines, cfg.max_dangle_length_m, cfg.node_rounding_decimals)
@@ -1224,6 +1347,8 @@ def create_automatic_taz(
         coarse, save_candidate = first_coarse.copy().reset_index(drop=True), False
     else:
         coarse, save_candidate = _merge_small(cleanup_candidate, cfg.coarse_min_area_km2).reset_index(drop=True), True
+    coarse = _normalize_polygon_frame(coarse, stage="coarse partition")
+    _validate_partition(coarse, city_geom, stage="coarse partition")
     coarse["coarse_zone_id"] = range(len(coarse))
     for name, frame in [("11_initial_coarse_zones", first_coarse), ("11a_initial_coarse_dangles", first_dangles),
                         ("12_coarse_boundary_corridors", coarse_corridors), ("13_coarse_boundary_centerlines_raw", coarse_centerlines),
@@ -1234,9 +1359,17 @@ def create_automatic_taz(
     _export_layer(coarse, cfg.output_dir / "15_coarse_zones.geojson", cfg)
     records, divider_records = [], []
     for coarse_id, row in coarse.iterrows():
+        logging.info(
+            "Splitting coarse zone %d/%d (%.3f km2)",
+            coarse_id + 1, len(coarse), float(row.area_km2),
+        )
         zone_records, dividers = _recursive_split(row.geometry, local, metric_crs, cfg, coarse_id)
         records.extend(zone_records)
         divider_records.extend(dividers)
+        logging.info(
+            "Completed coarse zone %d/%d with %d final part(s)",
+            coarse_id + 1, len(coarse), len(zone_records),
+        )
     if cfg.retry_failed_splits_with_enclosed_zones:
         final, divider_records, hole_absorptions = _retry_failed(records, divider_records, local, metric_crs, cfg)
     else:
@@ -1248,7 +1381,10 @@ def create_automatic_taz(
     final, post_corridor_merges = _merge_final_undersized(
         final, cfg.final_min_area_km2, metric_crs
     )
-    final = final.reset_index(drop=True)
+    final = _normalize_polygon_frame(
+        final.reset_index(drop=True), stage="final TAZ partition"
+    )
+    _validate_partition(final, city_geom, stage="final TAZ partition")
     final["taz_id"] = [f"{cfg.city_name}_{i:05d}" for i in range(1, len(final) + 1)]
     dividers = (
         gpd.GeoDataFrame(divider_records, geometry="geometry", crs=metric_crs)
