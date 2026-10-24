@@ -475,6 +475,52 @@ class TAZTests(unittest.TestCase):
             simplified, boundary, stage="simplified test partition"
         )
 
+    def test_plot_taz_builds_opaque_interactive_basemap_without_mutation(self) -> None:
+        """Render clear TAZ fills and hover fields over the configured map."""
+        zones = gpd.GeoDataFrame(
+            {
+                "taz_id": ["left", "right"],
+                "area_km2": [0.5, 0.5],
+            },
+            geometry=[box(77.0, 28.0, 77.01, 28.01), box(77.01, 28.0, 77.02, 28.01)],
+            crs="EPSG:4326",
+        )
+        original = zones.copy()
+
+        figure = ogm.taz.plot_taz(
+            zones,
+            opacity=0.8,
+            fill_color="#123456",
+            boundary_color="#FFFFFF",
+            boundary_width=1.0,
+            basemap_style="open-street-map",
+            hover_columns=("taz_id", "area_km2"),
+        )
+
+        self.assertEqual(figure.layout.mapbox.style, "open-street-map")
+        self.assertEqual(figure.data[0].marker.opacity, 0.8)
+        self.assertEqual(figure.data[0].marker.line.color, "#FFFFFF")
+        self.assertEqual(figure.data[0].marker.line.width, 1.0)
+        self.assertEqual(list(figure.data[0].locations), ["0", "1"])
+        self.assertIn("taz_id", figure.data[0].hovertemplate)
+        self.assertTrue(zones.geometry.equals(original.geometry))
+        self.assertEqual(zones.crs, original.crs)
+
+    def test_plot_taz_validates_style_and_hover_options(self) -> None:
+        """Reject invalid opacity and missing hover attributes."""
+        zones = gpd.GeoDataFrame(
+            {"taz_id": ["one"], "area_km2": [1.0]},
+            geometry=[box(77.0, 28.0, 77.01, 28.01)],
+            crs="EPSG:4326",
+        )
+
+        with self.assertRaisesRegex(ValueError, "opacity"):
+            ogm.taz.plot_taz(zones, opacity=1.1)
+        with self.assertRaisesRegex(ValueError, "Hover columns"):
+            ogm.taz.plot_taz(zones, hover_columns=("missing",))
+        with self.assertRaisesRegex(TypeError, "iterable"):
+            ogm.taz.plot_taz(zones, hover_columns="taz_id")
+
     def test_automatic_taz_pipeline_handles_no_recursive_dividers(self) -> None:
         """Create/export a coarse partition when zones already meet size goals."""
         from opengeomove.taz import automatic
