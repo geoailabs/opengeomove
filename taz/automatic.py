@@ -22,12 +22,13 @@ from typing import Any
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely import make_valid
+from shapely import coverage_simplify, make_valid
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon
 from shapely.ops import nearest_points, polygonize_full, split, unary_union
 
 from opengeomove.taz.exceptions import TAZDependencyError, TAZGeometryError
 from opengeomove.taz.models import StudyArea, TAZFrame
+from opengeomove.taz.population import population_cells
 from opengeomove.data_loading.spatial import read_spatial_layer
 
 
@@ -59,6 +60,18 @@ class AutomaticTAZConfig:
     building_presence_threshold: float = 0.5
     building_kmeans_n_init: int = 20
     building_max_samples: int = 100_000
+    adaptive_sizing: bool = False
+    target_area_km2: float | None = None
+    target_population: float | None = None
+    population_column: str = "population"
+    population_tolerance: float = 2.0
+    building_density_exponent: float = 0.20
+    adaptive_min_area_scale: float = 0.25
+    adaptive_max_area_scale: float = 8.0
+    split_compactness_weight: float = 1.0
+    split_balance_weight: float = 1.0
+    road_alignment_bonus: float = 0.15
+    coverage_simplify_tolerance_m: float = 0.0
     export_crs: str = "EPSG:4326"
     save_plots: bool = True
     plot_formats: tuple[str, ...] = ("html", "png")
@@ -126,6 +139,47 @@ class AutomaticTAZConfig:
             raise ValueError("building raster band indexes are 1-based positive integers")
         if self.building_max_samples < 2 or self.building_kmeans_n_init < 1:
             raise ValueError("building sample and KMeans initialization counts are too small")
+        if not isinstance(self.adaptive_sizing, bool):
+            raise TypeError("adaptive_sizing must be a bool")
+        if self.target_area_km2 is not None and (
+            isinstance(self.target_area_km2, bool)
+            or not math.isfinite(self.target_area_km2)
+            or self.target_area_km2 <= 0
+        ):
+            raise ValueError("target_area_km2 must be finite and positive")
+        if self.target_population is not None and (
+            isinstance(self.target_population, bool)
+            or not math.isfinite(self.target_population)
+            or self.target_population <= 0
+        ):
+            raise ValueError("target_population must be finite and positive")
+        if not math.isfinite(self.population_tolerance) or self.population_tolerance < 1:
+            raise ValueError("population_tolerance must be finite and at least 1")
+        if not math.isfinite(self.building_density_exponent) or self.building_density_exponent < 0:
+            raise ValueError("building_density_exponent must be finite and non-negative")
+        if (
+            not math.isfinite(self.adaptive_min_area_scale)
+            or not math.isfinite(self.adaptive_max_area_scale)
+            or self.adaptive_min_area_scale <= 0
+            or self.adaptive_max_area_scale < self.adaptive_min_area_scale
+        ):
+            raise ValueError("adaptive area scales must be finite, positive, and ordered")
+        split_quality_values = (
+            self.split_compactness_weight,
+            self.split_balance_weight,
+            self.road_alignment_bonus,
+        )
+        if any(not math.isfinite(value) or value < 0 for value in split_quality_values):
+            raise ValueError("split-quality weights and bonuses must be finite and non-negative")
+        if self.split_compactness_weight + self.split_balance_weight <= 0:
+            raise ValueError("at least one split-quality weight must be positive")
+        if (
+            not math.isfinite(self.coverage_simplify_tolerance_m)
+            or self.coverage_simplify_tolerance_m < 0
+        ):
+            raise ValueError("coverage_simplify_tolerance_m must be finite and non-negative")
+        if self.adaptive_sizing and self.target_area_km2 is None:
+            raise ValueError("adaptive_sizing requires target_area_km2")
         if not self.plot_formats or not set(self.plot_formats).issubset({"html", "png", "pdf"}):
             raise ValueError("plot_formats must contain html, png, or pdf")
         area_values = (
@@ -149,6 +203,17 @@ class AutomaticTAZConfig:
 
 
 Config = AutomaticTAZConfig
+
+
+@dataclass
+class _AdaptiveEvidence:
+    """Reusable population and building evidence for recursive splitting."""
+
+    population: gpd.GeoDataFrame | None = None
+    buildings: gpd.GeoDataFrame | None = None
+    city_building_density: float | None = None
+    population_cache: dict[bytes, float] = field(default_factory=dict)
+    building_density_cache: dict[bytes, float] = field(default_factory=dict)
 
 
 def _require_networkx():
@@ -269,6 +334,42 @@ def _validate_partition(
             f"overlap={overlap:.3f} m2, uncovered={uncovered:.3f} m2, "
             f"outside={outside:.3f} m2, tolerance={tolerance:.3f} m2"
         )
+
+
+def _simplify_partition_coverage(
+    zones: gpd.GeoDataFrame,
+    tolerance_m: float,
+    boundary: Any,
+) -> gpd.GeoDataFrame:
+    """Simplify shared edges while preserving zone coverage and attributes.
+
+    Args:
+        zones: Final polygon partition in a projected metric CRS.
+        tolerance_m: Visvalingam-Whyatt coverage simplification tolerance.
+        boundary: Original study-area boundary used for validation.
+
+    Returns:
+        A normalized partition with simplified internal edges. A zero
+        tolerance returns a refreshed copy without modifying coordinates.
+
+    Raises:
+        TAZGeometryError: If simplification breaks the partition topology.
+    """
+    if tolerance_m <= 0:
+        return _area(zones)
+    simplified = zones.copy()
+    simplified.geometry = coverage_simplify(
+        zones.geometry.to_numpy(),
+        tolerance_m,
+        simplify_boundary=False,
+    )
+    simplified = _normalize_polygon_frame(
+        simplified, stage="simplified final TAZ partition"
+    )
+    _validate_partition(
+        simplified, boundary, stage="simplified final TAZ partition"
+    )
+    return simplified
 
 
 def _lines(geometry: Any) -> list[LineString]:
@@ -544,7 +645,324 @@ def _building_raster_coverages(paths: tuple[str, ...], metric_crs: str):
     return tuple(coverages)
 
 
-def _building_cluster_centers(parent: Polygon, metric_crs, cfg: AutomaticTAZConfig):
+def _load_building_evidence(
+    boundary: Any,
+    metric_crs: Any,
+    cfg: AutomaticTAZConfig,
+) -> gpd.GeoDataFrame:
+    """Read a bounded city-wide sample of weighted building cells.
+
+    The sample is created once per run and reused through the recursive split
+    tree. Each point carries a ``building_mass`` proportional to fractional
+    building count, height, and represented ground area.
+
+    Args:
+        boundary: Study-area geometry in ``metric_crs``.
+        metric_crs: Projected CRS used by the TAZ workflow.
+        cfg: Automatic TAZ configuration and raster-band selection.
+
+    Returns:
+        Building-center points with a non-negative ``building_mass`` column.
+
+    Raises:
+        TAZDependencyError: If raster support is unavailable.
+    """
+    paths = _building_raster_paths(cfg.building_raster_path)
+    if not paths:
+        return gpd.GeoDataFrame(
+            {"building_mass": pd.Series(dtype=float)},
+            geometry=[],
+            crs=metric_crs,
+        )
+    try:
+        import rasterio
+        from affine import Affine
+        from rasterio.enums import Resampling
+        from rasterio.features import geometry_mask
+        from rasterio.windows import Window, from_bounds
+        from rasterio.warp import transform as transform_coordinates
+    except ImportError as exc:
+        raise TAZDependencyError(
+            "Building-aware TAZ creation requires rasterio"
+        ) from exc
+
+    windows: list[tuple[Path, Any, Any, float]] = []
+    total_pixels = 0.0
+    for path in paths:
+        with rasterio.open(path) as source:
+            if source.crs is None:
+                logging.warning("Skipping building raster without a CRS: %s", path)
+                continue
+            boundary_raster = gpd.GeoSeries(
+                [boundary], crs=metric_crs
+            ).to_crs(source.crs).iloc[0]
+            raster_bounds = Polygon.from_bounds(*source.bounds)
+            clipped = boundary_raster.intersection(raster_bounds)
+            if clipped.is_empty:
+                continue
+            window = from_bounds(
+                *clipped.bounds, transform=source.transform
+            ).round_offsets().round_lengths()
+            try:
+                window = window.intersection(
+                    Window(0, 0, source.width, source.height)
+                )
+            except rasterio.errors.WindowError:
+                continue
+            if window.width <= 0 or window.height <= 0:
+                continue
+            clipped_metric_area = float(
+                gpd.GeoSeries([clipped], crs=source.crs).to_crs(metric_crs).iloc[0].area
+            )
+            windows.append((path, window, clipped, clipped_metric_area))
+            total_pixels += float(window.width * window.height)
+
+    if not windows:
+        return gpd.GeoDataFrame(
+            {"building_mass": pd.Series(dtype=float)},
+            geometry=[],
+            crs=metric_crs,
+        )
+    scale = max(1.0, math.sqrt(total_pixels / cfg.building_max_samples))
+    points: list[Point] = []
+    masses: list[float] = []
+    for path, window, clipped, clipped_metric_area in windows:
+        with rasterio.open(path) as source:
+            output_width = max(1, int(math.ceil(window.width / scale)))
+            output_height = max(1, int(math.ceil(window.height / scale)))
+            if source.count >= max(
+                cfg.building_count_band,
+                cfg.building_height_band,
+                cfg.building_presence_band,
+            ):
+                indexes = [
+                    cfg.building_count_band,
+                    cfg.building_height_band,
+                    cfg.building_presence_band,
+                ]
+            else:
+                indexes = [1]
+            values = source.read(
+                indexes,
+                window=window,
+                out_shape=(len(indexes), output_height, output_width),
+                masked=True,
+                resampling=Resampling.average,
+            )
+            transform = source.window_transform(window) @ Affine.scale(
+                window.width / output_width,
+                window.height / output_height,
+            )
+            inside = geometry_mask(
+                [clipped.__geo_interface__],
+                out_shape=(output_height, output_width),
+                transform=transform,
+                invert=True,
+            )
+            valid = inside & ~np.any(np.ma.getmaskarray(values), axis=0)
+            if len(indexes) == 3:
+                count, height, presence = (
+                    np.asarray(values[index].data, dtype=float)
+                    for index in range(3)
+                )
+                valid &= (
+                    np.isfinite(count)
+                    & np.isfinite(height)
+                    & np.isfinite(presence)
+                    & (count > 0)
+                    & (height > 0)
+                    # Presence is averaged into city-wide evidence cells, so
+                    # any positive coverage is retained here. The configured
+                    # threshold still applies to detailed raster clustering.
+                    & (presence > 0)
+                )
+                raw_mass = count * height
+            else:
+                raw_mass = np.asarray(values[0].data, dtype=float)
+                valid &= np.isfinite(raw_mass) & (raw_mass > 0)
+            rows, columns = np.where(valid)
+            if not len(rows):
+                continue
+            represented_area = clipped_metric_area / max(int(inside.sum()), 1)
+            xs, ys = rasterio.transform.xy(
+                transform, rows, columns, offset="center"
+            )
+            if str(source.crs) != str(metric_crs):
+                xs, ys = transform_coordinates(source.crs, metric_crs, xs, ys)
+            points.extend(Point(x, y) for x, y in zip(xs, ys))
+            masses.extend((raw_mass[valid] * represented_area).tolist())
+    frame = gpd.GeoDataFrame(
+        {"building_mass": np.asarray(masses, dtype=float)},
+        geometry=points,
+        crs=metric_crs,
+    )
+    logging.info(
+        "Prepared %d reusable building evidence point(s) for adaptive splitting",
+        len(frame),
+    )
+    return frame
+
+
+def _evidence_subset(
+    points: gpd.GeoDataFrame | None, geometry: Any
+) -> gpd.GeoDataFrame:
+    """Return evidence points covered by one candidate zone."""
+    if points is None or points.empty:
+        return points.iloc[0:0] if points is not None else gpd.GeoDataFrame()
+    positions = points.sindex.query(geometry, predicate="intersects")
+    if not len(positions):
+        return points.iloc[0:0]
+    candidates = points.iloc[positions]
+    return candidates[candidates.geometry.map(geometry.covers)]
+
+
+def _zone_population(geometry: Any, evidence: _AdaptiveEvidence | None) -> float | None:
+    """Allocate population cells by intersection area to one candidate zone."""
+    if evidence is None or evidence.population is None:
+        return None
+    key = geometry.wkb
+    if key in evidence.population_cache:
+        return evidence.population_cache[key]
+    cells = evidence.population
+    positions = cells.sindex.query(geometry, predicate="intersects")
+    total = 0.0
+    for position in positions:
+        cell = cells.geometry.iloc[int(position)]
+        if cell.area > 0:
+            total += float(cells.population.iloc[int(position)]) * (
+                geometry.intersection(cell).area / cell.area
+            )
+    evidence.population_cache[key] = total
+    return total
+
+
+def _zone_building_density(
+    geometry: Any, evidence: _AdaptiveEvidence | None
+) -> float | None:
+    """Return sampled building mass per square metre for one candidate zone."""
+    if evidence is None or evidence.buildings is None:
+        return None
+    key = geometry.wkb
+    if key in evidence.building_density_cache:
+        return evidence.building_density_cache[key]
+    points = _evidence_subset(evidence.buildings, geometry)
+    density = (
+        float(points.building_mass.sum()) / geometry.area
+        if geometry.area > 0 and not points.empty
+        else 0.0
+    )
+    evidence.building_density_cache[key] = density
+    return density
+
+
+def _zone_building_mass(
+    geometry: Any, evidence: _AdaptiveEvidence | None
+) -> float | None:
+    """Return sampled building mass within one candidate zone."""
+    density = _zone_building_density(geometry, evidence)
+    return None if density is None else density * geometry.area
+
+
+def _split_quality(
+    children: list[Any],
+    cfg: AutomaticTAZConfig,
+    evidence: _AdaptiveEvidence | None,
+    *,
+    road_aligned: bool,
+) -> dict[str, float]:
+    """Score one valid split from child compactness and allocation balance.
+
+    Population balance is preferred when population evidence is available;
+    otherwise sampled building mass is used. Area balance is always included,
+    preventing a concentrated evidence sample from creating extreme slivers.
+    A bounded bonus preserves the preference for road-aligned boundaries when
+    their geometry is reasonably competitive.
+
+    Args:
+        children: Polygonal children produced by one divider candidate.
+        cfg: Split-quality weights and road-alignment preference.
+        evidence: Optional population and building evidence.
+        road_aligned: Whether the divider follows the local road network.
+
+    Returns:
+        Component scores and the combined ``split_quality`` value. All
+        component scores except the configured bonus are in the range 0–1.
+    """
+    areas = np.asarray([float(child.area) for child in children], dtype=float)
+    compactness_values = np.asarray([
+        4.0 * math.pi * child.area / (child.length ** 2)
+        if child.area > 0 and child.length > 0 else 0.0
+        for child in children
+    ])
+    compactness = float(np.average(compactness_values, weights=areas))
+    area_balance = float(areas.min() / areas.max()) if areas.max() > 0 else 0.0
+
+    masses: list[float] | None = None
+    if evidence is not None and evidence.population is not None:
+        masses = [float(_zone_population(child, evidence) or 0.0) for child in children]
+    elif evidence is not None and evidence.buildings is not None:
+        masses = [float(_zone_building_mass(child, evidence) or 0.0) for child in children]
+    if masses is not None and max(masses, default=0.0) > 0:
+        evidence_balance = min(masses) / max(masses)
+        balance = (area_balance + evidence_balance) / 2.0
+    else:
+        evidence_balance = area_balance
+        balance = area_balance
+
+    road_bonus = cfg.road_alignment_bonus if road_aligned else 0.0
+    quality = (
+        cfg.split_compactness_weight * compactness
+        + cfg.split_balance_weight * balance
+        + road_bonus
+    )
+    return {
+        "split_quality": float(quality),
+        "split_compactness": compactness,
+        "split_area_balance": area_balance,
+        "split_evidence_balance": float(evidence_balance),
+        "split_road_bonus": float(road_bonus),
+    }
+
+
+def _select_split_candidate(
+    candidates: list[dict[str, Any]],
+    cfg: AutomaticTAZConfig,
+    evidence: _AdaptiveEvidence | None,
+) -> dict[str, Any] | None:
+    """Return the highest-quality valid divider candidate.
+
+    Args:
+        candidates: Candidate dictionaries containing ``children`` and a
+            ``road_aligned`` flag, plus caller-specific divider metadata.
+        cfg: Split-quality configuration.
+        evidence: Optional population and building evidence.
+
+    Returns:
+        The winning candidate with quality diagnostics, or ``None`` when no
+        candidate creates at least two polygonal children.
+    """
+    scored = []
+    for candidate in candidates:
+        if len(candidate.get("children", [])) < 2:
+            continue
+        scored.append({
+            **candidate,
+            **_split_quality(
+                candidate["children"],
+                cfg,
+                evidence,
+                road_aligned=bool(candidate.get("road_aligned")),
+            ),
+        })
+    return max(scored, key=lambda item: item["split_quality"], default=None)
+
+
+def _building_cluster_centers(
+    parent: Polygon,
+    metric_crs,
+    cfg: AutomaticTAZConfig,
+    evidence: _AdaptiveEvidence | None = None,
+):
     """Return two height-weighted building clusters from intersecting tiles.
 
     Google 2.5D tiles have fractional-count, height, and presence bands. The
@@ -552,6 +970,45 @@ def _building_cluster_centers(parent: Polygon, metric_crs, cfg: AutomaticTAZConf
     0.5-metre windows are downsampled before clustering so a city run does not
     materialize millions of pixels for each candidate TAZ.
     """
+    if evidence is not None and evidence.buildings is not None:
+        points = _evidence_subset(evidence.buildings, parent)
+        if len(points) < 2:
+            return None
+        coordinates = np.column_stack([points.geometry.x, points.geometry.y])
+        weights = points.building_mass.to_numpy(dtype=float)
+        if len(coordinates) > cfg.building_max_samples:
+            keep = np.linspace(
+                0, len(coordinates) - 1, cfg.building_max_samples, dtype=int
+            )
+            coordinates, weights = coordinates[keep], weights[keep]
+        if np.unique(coordinates, axis=0).shape[0] < 2:
+            return None
+        try:
+            from sklearn.cluster import KMeans
+        except ImportError as exc:
+            raise TAZDependencyError(
+                "Building-aware TAZ creation requires scikit-learn"
+            ) from exc
+        labels = KMeans(
+            n_clusters=2, random_state=42, n_init=cfg.building_kmeans_n_init
+        ).fit(coordinates, sample_weight=weights).labels_
+        centers = [
+            Point(
+                np.average(
+                    coordinates[labels == label, 0], weights=weights[labels == label]
+                ),
+                np.average(
+                    coordinates[labels == label, 1], weights=weights[labels == label]
+                ),
+            )
+            for label in (0, 1)
+        ]
+        return {
+            "b0": centers[0],
+            "b1": centers[1],
+            "n_building_cells": len(coordinates),
+        }
+
     paths = _building_raster_paths(cfg.building_raster_path)
     if not paths:
         return None
@@ -735,7 +1192,7 @@ def _combined_divider(parent, c0, c1, building, cfg):
     return divider, info
 
 
-def _metis_split(parent, local_roads, crs, cfg):
+def _metis_split(parent, local_roads, crs, cfg, evidence=None):
     """Partition a clipped road graph and construct a road-aligned divider."""
     nx = _require_networkx()
     pymetis = _require_pymetis()
@@ -766,37 +1223,49 @@ def _metis_split(parent, local_roads, crs, cfg):
     if not groups[0] or not groups[1]:
         return None, "empty_metis_partition", roads
     centers = [unary_union(group).centroid for group in groups]
-    building = _building_cluster_centers(parent, crs, cfg)
+    building = _building_cluster_centers(parent, crs, cfg, evidence)
     divider, divider_info = _combined_divider(
         parent, centers[0], centers[1], building, cfg
     )
     if divider is None:
         return None, "identical_metis_centroids", roads
     hybrid = _aligned_divider(divider, roads, cfg)
-    children = _split_all(parent, hybrid, cfg.min_child_area_m2)
-    if len(children) == 2:
-        return {
-            "children": children,
-            "method": "metis_building_road_aligned" if divider_info["building_used"] else "metis_road_aligned",
+    aligned_method = (
+        "metis_building_road_aligned"
+        if divider_info["building_used"] else "metis_road_aligned"
+    )
+    straight_method = (
+        "metis_building_straight"
+        if divider_info["building_used"] else "metis_straight"
+    )
+    winner = _select_split_candidate([
+        {
+            "children": _split_all(parent, hybrid, cfg.min_child_area_m2),
+            "method": aligned_method,
             "divider": hybrid,
-            "reason": "",
-            **divider_info,
-        }, "", roads
-    children = _split_all(parent, divider, cfg.min_child_area_m2)
-    if len(children) == 2:
-        return {
-            "children": children,
-            "method": "metis_building_straight" if divider_info["building_used"] else "metis_straight",
+            "road_aligned": True,
+        },
+        {
+            "children": _split_all(parent, divider, cfg.min_child_area_m2),
+            "method": straight_method,
             "divider": divider,
-            "reason": "road_aligned_divider_failed",
-            **divider_info,
-        }, "", roads
+            "road_aligned": False,
+        },
+    ], cfg, evidence)
+    if winner is not None and len(winner["children"]) == 2:
+        winner["reason"] = (
+            ""
+            if winner["road_aligned"]
+            else "road_aligned_divider_failed_or_lower_quality"
+        )
+        winner.update(divider_info)
+        return winner, "", roads
     return None, "metis_divider_did_not_make_two_children", roads
 
 
-def _building_split(parent, local_roads, crs, cfg):
+def _building_split(parent, local_roads, crs, cfg, evidence=None):
     """Split from building clusters when a usable road graph is unavailable."""
-    building = _building_cluster_centers(parent, crs, cfg)
+    building = _building_cluster_centers(parent, crs, cfg, evidence)
     if building is None:
         return None, "no_usable_building_clusters"
     b0, b1 = building["b0"], building["b1"]
@@ -808,28 +1277,32 @@ def _building_split(parent, local_roads, crs, cfg):
         return None, "identical_building_centroids"
     roads = gpd.clip(local_roads, _gdf([parent], crs))
     hybrid = _aligned_divider(divider, roads, cfg)
-    children = _split_all(parent, hybrid, cfg.min_child_area_m2)
-    if len(children) == 2:
-        return {
-            "children": children,
+    winner = _select_split_candidate([
+        {
+            "children": _split_all(parent, hybrid, cfg.min_child_area_m2),
             "method": "building_road_aligned",
             "divider": hybrid,
-            "reason": "",
-            "n_building_cells": building["n_building_cells"],
-        }, ""
-    children = _split_all(parent, divider, cfg.min_child_area_m2)
-    if len(children) == 2:
-        return {
-            "children": children,
+            "road_aligned": True,
+        },
+        {
+            "children": _split_all(parent, divider, cfg.min_child_area_m2),
             "method": "building_straight",
             "divider": divider,
-            "reason": "road_aligned_divider_failed",
-            "n_building_cells": building["n_building_cells"],
-        }, ""
+            "road_aligned": False,
+        },
+    ], cfg, evidence)
+    if winner is not None and len(winner["children"]) == 2:
+        winner["reason"] = (
+            ""
+            if winner["road_aligned"]
+            else "road_aligned_divider_failed_or_lower_quality"
+        )
+        winner["n_building_cells"] = building["n_building_cells"]
+        return winner, ""
     return None, "building_divider_did_not_make_two_children"
 
 
-def _oriented_split(parent, local_roads, crs, cfg):
+def _oriented_split(parent, local_roads, crs, cfg, evidence=None):
     """Split a polygon along its principal axis, optionally snapping to roads."""
     hull = parent.convex_hull
     coords = np.asarray(hull.exterior.coords)[:, :2]
@@ -843,50 +1316,159 @@ def _oriented_split(parent, local_roads, crs, cfg):
     ])
     roads = gpd.clip(local_roads, _gdf([parent], crs))
     hybrid = _aligned_divider(straight, roads, cfg)
-    raw = _split_all(parent, hybrid, cfg.min_child_area_m2)
-    children = _merge_children(raw, crs, cfg.oriented_fallback_min_area_km2)
-    if len(children) >= 2:
-        return {"children": children, "method": "oriented_road_aligned", "divider": hybrid,
-                "raw_child_count": len(raw), "merged_child_count": len(raw) - len(children),
-                "roads": roads}
-    raw = _split_all(parent, straight, cfg.min_child_area_m2)
-    children = _merge_children(raw, crs, cfg.oriented_fallback_min_area_km2)
-    if len(children) >= 2:
-        return {"children": children, "method": "oriented_straight", "divider": straight,
-                "raw_child_count": len(raw), "merged_child_count": len(raw) - len(children),
-                "roads": roads}
-    return None
+    aligned_raw = _split_all(parent, hybrid, cfg.min_child_area_m2)
+    straight_raw = _split_all(parent, straight, cfg.min_child_area_m2)
+    candidates = []
+    for raw, children, method, candidate_divider, road_aligned in (
+        (
+            aligned_raw,
+            _merge_children(aligned_raw, crs, cfg.oriented_fallback_min_area_km2),
+            "oriented_road_aligned",
+            hybrid,
+            True,
+        ),
+        (
+            straight_raw,
+            _merge_children(straight_raw, crs, cfg.oriented_fallback_min_area_km2),
+            "oriented_straight",
+            straight,
+            False,
+        ),
+    ):
+        candidates.append({
+            "children": children,
+            "method": method,
+            "divider": candidate_divider,
+            "road_aligned": road_aligned,
+            "raw_child_count": len(raw),
+            "merged_child_count": len(raw) - len(children),
+            "roads": roads,
+        })
+    return _select_split_candidate(candidates, cfg, evidence)
 
 
-def _oriented_recursive(parent, roads, crs, cfg, coarse_id, depth, failure):
+def _adaptive_split_decision(
+    parent: Any,
+    cfg: AutomaticTAZConfig,
+    evidence: _AdaptiveEvidence | None,
+) -> dict[str, Any]:
+    """Return adaptive area, population, and building split evidence.
+
+    Fixed-area behavior is retained when ``adaptive_sizing`` is false. In
+    adaptive mode, building density scales the preferred upper area while an
+    optional population target can independently require another split.
+    """
+    area_km2 = float(parent.area / 1_000_000.0)
+    population = _zone_population(parent, evidence)
+    building_density = _zone_building_density(parent, evidence)
+    target_area = cfg.final_max_area_km2
+    area_scale = 1.0
+    if cfg.adaptive_sizing:
+        target_area = float(cfg.target_area_km2)
+        global_density = evidence.city_building_density if evidence else None
+        if (
+            building_density is not None
+            and global_density is not None
+            and global_density > 0
+        ):
+            density_ratio = max(building_density / global_density, 1e-9)
+            area_scale = float(np.clip(
+                density_ratio ** (-cfg.building_density_exponent),
+                cfg.adaptive_min_area_scale,
+                cfg.adaptive_max_area_scale,
+            ))
+        target_area = float(np.clip(
+            target_area * area_scale,
+            cfg.final_min_area_km2,
+            cfg.final_max_area_km2,
+        ))
+    area_score = area_km2 / target_area
+    population_score = 0.0
+    if population is not None and cfg.target_population is not None:
+        population_score = population / (
+            cfg.target_population * cfg.population_tolerance
+        )
+    split_score = max(area_score, population_score)
+    should_split = (
+        area_km2 > cfg.final_min_area_km2
+        and (split_score > 1.0 or area_km2 > cfg.final_max_area_km2)
+    )
+    return {
+        "area_km2": area_km2,
+        "adaptive_target_area_km2": target_area,
+        "adaptive_area_scale": area_scale,
+        "population": population,
+        "building_density": building_density,
+        "split_score": split_score,
+        "should_split": should_split,
+    }
+
+
+def _record_evidence(decision: dict[str, Any]) -> dict[str, Any]:
+    """Select stable adaptive evidence fields for output zone records."""
+    return {
+        key: decision[key]
+        for key in (
+            "adaptive_target_area_km2",
+            "adaptive_area_scale",
+            "population",
+            "building_density",
+            "split_score",
+        )
+    }
+
+
+def _oriented_recursive(
+    parent, roads, crs, cfg, coarse_id, depth, failure, evidence=None
+):
     """Recursively apply the oriented fallback and retain failure metadata."""
-    current = parent.area / 1_000_000.0
-    base = {"coarse_zone_id": coarse_id, "depth": depth, "area_km2": current}
-    if cfg.oriented_fallback_min_area_km2 <= current <= cfg.oriented_fallback_max_area_km2:
+    decision = _adaptive_split_decision(parent, cfg, evidence)
+    current = decision["area_km2"]
+    base = {
+        "coarse_zone_id": coarse_id,
+        "depth": depth,
+        "area_km2": current,
+        **_record_evidence(decision),
+    }
+    if not decision["should_split"] and current >= cfg.final_min_area_km2:
         return [{**base, "geometry": parent, "status": "oriented_valid", "split_method": "oriented", "failure_reason": failure}], []
-    if current < cfg.oriented_fallback_min_area_km2 or depth >= cfg.max_split_depth:
-        status = "oriented_undersized" if current < cfg.oriented_fallback_min_area_km2 else "oriented_max_depth"
+    if current < cfg.final_min_area_km2 or depth >= cfg.max_split_depth:
+        status = "oriented_undersized" if current < cfg.final_min_area_km2 else "oriented_max_depth"
         return [{**base, "geometry": parent, "status": status, "split_method": "oriented", "failure_reason": failure}], []
-    info = _oriented_split(parent, roads, crs, cfg)
+    info = _oriented_split(parent, roads, crs, cfg, evidence)
     if info is None:
         return [{**base, "geometry": parent, "status": "oriented_split_failed", "split_method": "oriented", "failure_reason": failure}], []
     divider = {"geometry": info["divider"], "coarse_zone_id": coarse_id, "depth": depth,
                "method": info["method"], "metis_failure_reason": failure,
                "raw_child_count": info["raw_child_count"], "merged_undersized_children": info["merged_child_count"]}
+    divider.update({key: info[key] for key in (
+        "split_quality", "split_compactness", "split_area_balance",
+        "split_evidence_balance", "split_road_bonus",
+    )})
     records, dividers = [], [divider]
     child_roads = info.get("roads", roads)
     for child in info["children"]:
-        child_records, child_dividers = _oriented_recursive(child, child_roads, crs, cfg, coarse_id, depth + 1, failure)
+        child_records, child_dividers = _oriented_recursive(
+            child, child_roads, crs, cfg, coarse_id, depth + 1, failure, evidence
+        )
         records.extend(child_records)
         dividers.extend(child_dividers)
     return records, dividers
 
 
-def _building_recursive(parent, roads, crs, cfg, coarse_id, depth, failure):
+def _building_recursive(
+    parent, roads, crs, cfg, coarse_id, depth, failure, evidence=None
+):
     """Try building-only recursion, then retain the PCA fallback."""
-    current = parent.area / 1_000_000.0
-    base = {"coarse_zone_id": coarse_id, "depth": depth, "area_km2": current}
-    if cfg.final_min_area_km2 <= current <= cfg.final_max_area_km2:
+    decision = _adaptive_split_decision(parent, cfg, evidence)
+    current = decision["area_km2"]
+    base = {
+        "coarse_zone_id": coarse_id,
+        "depth": depth,
+        "area_km2": current,
+        **_record_evidence(decision),
+    }
+    if not decision["should_split"] and current >= cfg.final_min_area_km2:
         return [{
             **base,
             "geometry": parent,
@@ -906,12 +1488,14 @@ def _building_recursive(parent, roads, crs, cfg, coarse_id, depth, failure):
         return _oriented_recursive(
             parent, roads, crs, cfg, coarse_id, depth,
             f"{failure};building_max_depth",
+            evidence,
         )
-    info, building_failure = _building_split(parent, roads, crs, cfg)
+    info, building_failure = _building_split(parent, roads, crs, cfg, evidence)
     if info is None:
         return _oriented_recursive(
             parent, roads, crs, cfg, coarse_id, depth,
             f"{failure};{building_failure}",
+            evidence,
         )
     divider = {
         "geometry": info["divider"],
@@ -921,43 +1505,61 @@ def _building_recursive(parent, roads, crs, cfg, coarse_id, depth, failure):
         "metis_failure_reason": failure,
         "n_building_cells": info["n_building_cells"],
     }
+    divider.update({key: info[key] for key in (
+        "split_quality", "split_compactness", "split_area_balance",
+        "split_evidence_balance", "split_road_bonus",
+    )})
     records, dividers = [], [divider]
     for child in info["children"]:
         child_records, child_dividers = _building_recursive(
-            child, roads, crs, cfg, coarse_id, depth + 1, failure
+            child, roads, crs, cfg, coarse_id, depth + 1, failure, evidence
         )
         records.extend(child_records)
         dividers.extend(child_dividers)
     return records, dividers
 
 
-def _recursive_split(parent, roads, crs, cfg, coarse_id, depth=0):
+def _recursive_split(
+    parent, roads, crs, cfg, coarse_id, depth=0, evidence=None
+):
     """Recursively split one coarse polygon using METIS and fallback methods."""
-    current = parent.area / 1_000_000.0
-    base = {"coarse_zone_id": coarse_id, "depth": depth, "area_km2": current}
-    if cfg.final_min_area_km2 <= current <= cfg.final_max_area_km2:
+    decision = _adaptive_split_decision(parent, cfg, evidence)
+    current = decision["area_km2"]
+    base = {
+        "coarse_zone_id": coarse_id,
+        "depth": depth,
+        "area_km2": current,
+        **_record_evidence(decision),
+    }
+    if not decision["should_split"] and current >= cfg.final_min_area_km2:
         return [{**base, "geometry": parent, "status": "valid", "split_method": "none", "failure_reason": ""}], []
     if current < cfg.final_min_area_km2:
         return [{**base, "geometry": parent, "status": "undersized", "split_method": "none", "failure_reason": "below_minimum_before_split"}], []
     if depth >= cfg.max_split_depth:
         return [{**base, "geometry": parent, "status": "max_depth", "split_method": "none", "failure_reason": "max_depth_reached"}], []
-    info, reason, parent_roads = _metis_split(parent, roads, crs, cfg)
+    info, reason, parent_roads = _metis_split(parent, roads, crs, cfg, evidence)
     if info is None:
-        if current > cfg.oriented_fallback_trigger_km2:
+        if decision["should_split"] or current > cfg.oriented_fallback_trigger_km2:
             if cfg.building_raster_path is not None:
                 return _building_recursive(
-                    parent, parent_roads, crs, cfg, coarse_id, depth, reason
+                    parent, parent_roads, crs, cfg, coarse_id, depth, reason, evidence
                 )
             return _oriented_recursive(
-                parent, parent_roads, crs, cfg, coarse_id, depth, reason
+                parent, parent_roads, crs, cfg, coarse_id, depth, reason, evidence
             )
         return [{**base, "geometry": parent, "status": "split_failed", "split_method": "none", "failure_reason": reason}], []
     divider = {"geometry": info["divider"], "coarse_zone_id": coarse_id, "depth": depth,
                "method": info["method"], "metis_failure_reason": info["reason"],
                "building_used": info["building_used"]}
+    divider.update({key: info[key] for key in (
+        "split_quality", "split_compactness", "split_area_balance",
+        "split_evidence_balance", "split_road_bonus",
+    )})
     records, dividers = [], [divider]
     for child in info["children"]:
-        child_records, child_dividers = _recursive_split(child, parent_roads, crs, cfg, coarse_id, depth + 1)
+        child_records, child_dividers = _recursive_split(
+            child, parent_roads, crs, cfg, coarse_id, depth + 1, evidence
+        )
         records.extend(child_records)
         dividers.extend(child_dividers)
     return records, dividers
@@ -1071,7 +1673,7 @@ def _narrow_corridors(zones, width, minimum, crs):
     return working[working.geometry.notna() & ~working.geometry.is_empty], audit_gdf
 
 
-def _retry_failed(records, dividers, roads, crs, cfg):
+def _retry_failed(records, dividers, roads, crs, cfg, evidence=None):
     """Retry failed polygons after absorbing zones trapped in small holes."""
     result = gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
     absorbed = []
@@ -1093,7 +1695,15 @@ def _retry_failed(records, dividers, roads, crs, cfg):
             audit["absorbed_for_failed_status"] = failed.status
             absorbed.append(audit)
         filled = unary_union([failed.geometry, *result.loc[inner_ids].geometry.tolist()])
-        retry_records, retry_dividers = _recursive_split(filled, roads, crs, cfg, int(failed.coarse_zone_id), int(failed.depth))
+        retry_records, retry_dividers = _recursive_split(
+            filled,
+            roads,
+            crs,
+            cfg,
+            int(failed.coarse_zone_id),
+            int(failed.depth),
+            evidence,
+        )
         result = result.drop(index=[failed_id, *inner_ids])
         result = gpd.GeoDataFrame(pd.concat([result, gpd.GeoDataFrame(retry_records, geometry="geometry", crs=crs)], ignore_index=True), geometry="geometry", crs=crs)
         dividers.extend(retry_dividers)
@@ -1198,6 +1808,7 @@ def create_automatic_taz(
     boundary: Any,
     graph: Any = None,
     *,
+    population: Any = None,
     config: AutomaticTAZConfig | None = None,
     **overrides: Any,
 ) -> TAZFrame:
@@ -1210,11 +1821,15 @@ def create_automatic_taz(
     configured output directory. A local building raster or tile directory
     enables building-aware recursive splits. Alternatively,
     ``download_google_buildings=True`` downloads intersecting Google 2.5D
-    tiles for the configured year into a reusable local cache.
+    tiles for the configured year into a reusable local cache. ``population``
+    may be a raster path, population-cell GeoDataFrame, or PopulationSource;
+    it is used only when supplied and is never inferred from a reference TAZ.
 
     Args:
         boundary: Polygonal study boundary with a declared CRS.
         graph: Optional road graph or road edge layer.
+        population: Optional raster or vector population cells used by
+            adaptive split targets.
         config: Automatic TAZ settings. A copy is used; the caller's object is
             not mutated.
         **overrides: Fields that replace values on ``config``.
@@ -1292,6 +1907,47 @@ def create_automatic_taz(
         raise TAZGeometryError("Could not estimate a metric CRS for the boundary")
     city_m = city.to_crs(metric_crs)
     city_geom = city_m.geometry.union_all()
+    population_data = None
+    if population is not None:
+        population_data = population_cells(
+            population,
+            population_column=cfg.population_column,
+            target_crs=metric_crs,
+            boundary=city_geom,
+        )
+        logging.info(
+            "Prepared %d population cell(s) for adaptive splitting",
+            len(population_data),
+        )
+    building_evidence = None
+    if cfg.adaptive_sizing and cfg.building_raster_path is not None:
+        building_evidence = _load_building_evidence(city_geom, metric_crs, cfg)
+    evidence = _AdaptiveEvidence(
+        population=population_data,
+        buildings=building_evidence,
+        city_building_density=(
+            float(building_evidence.building_mass.sum()) / city_geom.area
+            if building_evidence is not None
+            and not building_evidence.empty
+            and city_geom.area > 0
+            else None
+        ),
+    )
+    population_total = _zone_population(city_geom, evidence)
+    if (
+        cfg.adaptive_sizing
+        and population_total is not None
+        and cfg.target_population is None
+    ):
+        expected_zones = max(
+            1.0, city_geom.area / (float(cfg.target_area_km2) * 1_000_000.0)
+        )
+        cfg.target_population = population_total / expected_zones
+        logging.info(
+            "Derived adaptive target population %.3f from %.3f total people",
+            cfg.target_population,
+            population_total,
+        )
     edges = _load_edges(graph, city, cfg)
     if edges.crs is None:
         raise TAZGeometryError("Road graph edges must have a CRS")
@@ -1363,7 +2019,14 @@ def create_automatic_taz(
             "Splitting coarse zone %d/%d (%.3f km2)",
             coarse_id + 1, len(coarse), float(row.area_km2),
         )
-        zone_records, dividers = _recursive_split(row.geometry, local, metric_crs, cfg, coarse_id)
+        zone_records, dividers = _recursive_split(
+            row.geometry,
+            local,
+            metric_crs,
+            cfg,
+            coarse_id,
+            evidence=evidence,
+        )
         records.extend(zone_records)
         divider_records.extend(dividers)
         logging.info(
@@ -1371,7 +2034,14 @@ def create_automatic_taz(
             coarse_id + 1, len(coarse), len(zone_records),
         )
     if cfg.retry_failed_splits_with_enclosed_zones:
-        final, divider_records, hole_absorptions = _retry_failed(records, divider_records, local, metric_crs, cfg)
+        final, divider_records, hole_absorptions = _retry_failed(
+            records,
+            divider_records,
+            local,
+            metric_crs,
+            cfg,
+            evidence,
+        )
     else:
         final, hole_absorptions = _area(gpd.GeoDataFrame(records, geometry="geometry", crs=metric_crs)), _gdf([], metric_crs)
     final, undersized_merges = _merge_final_undersized(
@@ -1385,14 +2055,36 @@ def create_automatic_taz(
         final.reset_index(drop=True), stage="final TAZ partition"
     )
     _validate_partition(final, city_geom, stage="final TAZ partition")
+    final = _simplify_partition_coverage(
+        final,
+        cfg.coverage_simplify_tolerance_m,
+        city_geom,
+    )
+    final_decisions = [
+        _adaptive_split_decision(geometry, cfg, evidence)
+        for geometry in final.geometry
+    ]
+    for key in (
+        "adaptive_target_area_km2",
+        "adaptive_area_scale",
+        "population",
+        "building_density",
+        "split_score",
+    ):
+        final[key] = [decision[key] for decision in final_decisions]
     final["taz_id"] = [f"{cfg.city_name}_{i:05d}" for i in range(1, len(final) + 1)]
     dividers = (
         gpd.GeoDataFrame(divider_records, geometry="geometry", crs=metric_crs)
         if divider_records
         else _gdf([], metric_crs)
     )
-    regular_target = final.area_km2.between(
-        cfg.final_min_area_km2, cfg.final_max_area_km2
+    regular_target = (
+        final.area_km2.ge(cfg.final_min_area_km2)
+        & (
+            final.split_score.le(1.0 + 1e-9)
+            if cfg.adaptive_sizing
+            else final.area_km2.le(cfg.final_max_area_km2)
+        )
     )
     oriented_target = (
         final.status.eq("oriented_valid")
@@ -1424,6 +2116,22 @@ def create_automatic_taz(
             else None
         ),
         "building_download": building_download_info,
+        "adaptive_sizing": cfg.adaptive_sizing,
+        "target_area_km2": cfg.target_area_km2,
+        "target_population": cfg.target_population,
+        "population_total": population_total,
+        "population_cells": (
+            int(len(population_data)) if population_data is not None else 0
+        ),
+        "building_evidence_points": (
+            int(len(building_evidence)) if building_evidence is not None else 0
+        ),
+        "city_building_density": evidence.city_building_density,
+        "building_density_exponent": cfg.building_density_exponent,
+        "split_compactness_weight": cfg.split_compactness_weight,
+        "split_balance_weight": cfg.split_balance_weight,
+        "road_alignment_bonus": cfg.road_alignment_bonus,
+        "coverage_simplify_tolerance_m": cfg.coverage_simplify_tolerance_m,
         **cfg.metadata,
     }
     return TAZFrame(final, metadata)

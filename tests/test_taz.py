@@ -102,6 +102,20 @@ class TAZTests(unittest.TestCase):
             ogm.taz.TAZConfig(min_area_km2=2, max_area_km2=1)
         with self.assertRaises(ValueError):
             ogm.taz.AutomaticTAZConfig(building_data_year=2024)
+        with self.assertRaisesRegex(ValueError, "target_area_km2"):
+            ogm.taz.AutomaticTAZConfig(adaptive_sizing=True)
+        with self.assertRaisesRegex(ValueError, "adaptive area scales"):
+            ogm.taz.AutomaticTAZConfig(
+                adaptive_min_area_scale=2,
+                adaptive_max_area_scale=1,
+            )
+        with self.assertRaisesRegex(ValueError, "split-quality"):
+            ogm.taz.AutomaticTAZConfig(road_alignment_bonus=-0.1)
+        with self.assertRaisesRegex(ValueError, "split-quality weight"):
+            ogm.taz.AutomaticTAZConfig(
+                split_compactness_weight=0,
+                split_balance_weight=0,
+            )
 
     def test_google_building_downloader_selects_intersecting_tiles_and_caches(self) -> None:
         """Download only boundary-intersecting public tiles and reuse the cache."""
@@ -189,7 +203,11 @@ class TAZTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             with (
-                patch.object(google_buildings, "_new_storage_client", return_value=fake_client),
+                patch.object(
+                    google_buildings,
+                    "_new_storage_client",
+                    side_effect=[fake_client, AssertionError("cache should avoid network")],
+                ),
                 patch.object(google_buildings, "_s2_covering_tokens", return_value=["fake"]),
             ):
                 first = google_buildings.download_open_buildings_25d(
@@ -368,6 +386,94 @@ class TAZTests(unittest.TestCase):
             automatic._validate_partition(
                 incomplete, boundary, stage="incomplete test"
             )
+
+    def test_adaptive_split_uses_building_density_and_population(self) -> None:
+        """Scale area targets by buildings and allow population to force a split."""
+        from opengeomove.taz import automatic
+
+        zone = box(0, 0, 1000, 1000)
+        buildings = gpd.GeoDataFrame(
+            {"building_mass": [2_000_000.0, 2_000_000.0]},
+            geometry=[box(100, 100, 101, 101).centroid, box(900, 900, 901, 901).centroid],
+            crs="EPSG:32643",
+        )
+        population = gpd.GeoDataFrame(
+            {"population": [2_000.0]},
+            geometry=[zone],
+            crs="EPSG:32643",
+        )
+        evidence = automatic._AdaptiveEvidence(
+            population=population,
+            buildings=buildings,
+            city_building_density=1.0,
+        )
+        config = ogm.taz.AutomaticTAZConfig(
+            adaptive_sizing=True,
+            target_area_km2=2.0,
+            target_population=500,
+            population_tolerance=2.0,
+            final_min_area_km2=0.05,
+            final_max_area_km2=8.0,
+        )
+
+        decision = automatic._adaptive_split_decision(zone, config, evidence)
+
+        self.assertTrue(decision["should_split"])
+        self.assertAlmostEqual(decision["population"], 2_000.0)
+        self.assertLess(decision["adaptive_target_area_km2"], 2.0)
+        self.assertEqual(decision["split_score"], 2.0)
+
+    def test_split_candidate_balances_compactness_against_road_alignment(self) -> None:
+        """Reject a badly imbalanced road split in favor of compact children."""
+        from opengeomove.taz import automatic
+
+        compact = [box(0, 0, 500, 1000), box(500, 0, 1000, 1000)]
+        imbalanced = [box(0, 0, 50, 1000), box(50, 0, 1000, 1000)]
+        winner = automatic._select_split_candidate(
+            [
+                {
+                    "name": "road",
+                    "children": imbalanced,
+                    "road_aligned": True,
+                },
+                {
+                    "name": "straight",
+                    "children": compact,
+                    "road_aligned": False,
+                },
+            ],
+            ogm.taz.AutomaticTAZConfig(road_alignment_bonus=0.15),
+            evidence=None,
+        )
+
+        self.assertIsNotNone(winner)
+        assert winner is not None
+        self.assertEqual(winner["name"], "straight")
+        self.assertGreater(winner["split_compactness"], 0.6)
+        self.assertEqual(winner["split_area_balance"], 1.0)
+
+    def test_coverage_simplification_preserves_partition(self) -> None:
+        """Simplify shared boundaries without introducing gaps or overlap."""
+        from opengeomove.taz import automatic
+
+        left = Polygon([(0, 0), (500, 0), (510, 250), (490, 500), (500, 1000), (0, 1000)])
+        right = Polygon([(500, 0), (1000, 0), (1000, 1000), (500, 1000), (490, 500), (510, 250)])
+        zones = gpd.GeoDataFrame(
+            {"name": ["left", "right"]},
+            geometry=[left, right],
+            crs="EPSG:32643",
+        )
+        boundary = box(0, 0, 1000, 1000)
+
+        simplified = automatic._simplify_partition_coverage(
+            zones, tolerance_m=25, boundary=boundary
+        )
+
+        self.assertEqual(simplified.name.tolist(), ["left", "right"])
+        self.assertTrue(simplified.geometry.is_valid.all())
+        automatic._validate_partition(
+            simplified, boundary, stage="simplified test partition"
+        )
 
     def test_automatic_taz_pipeline_handles_no_recursive_dividers(self) -> None:
         """Create/export a coarse partition when zones already meet size goals."""

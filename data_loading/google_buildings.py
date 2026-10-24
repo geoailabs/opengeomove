@@ -14,8 +14,9 @@ from urllib.parse import urlparse
 
 import geopandas as gpd
 from pyproj import Transformer
+from shapely import wkt
 from shapely.geometry import Polygon
-from shapely.ops import transform
+from shapely.ops import transform, unary_union
 
 
 _BUCKET = "open-buildings-temporal-data"
@@ -168,6 +169,73 @@ def _download_tile(storage_client, uri: str, destination: Path) -> Path:
     return destination
 
 
+def _cached_tile_paths(
+    cache: Path,
+    boundary_wgs84: Any,
+    year: int,
+) -> list[Path] | None:
+    """Return a complete compatible tile cache without network discovery.
+
+    New manifests record the boundary used to select their tiles. Legacy
+    manifests are accepted after checking the actual raster footprints, which
+    allows existing downloads to become offline-reusable without rewriting
+    source rasters or cache metadata.
+
+    Args:
+        cache: Year-specific building-raster cache directory.
+        boundary_wgs84: Requested polygonal boundary in WGS84.
+        year: Requested Open Buildings dataset year.
+
+    Returns:
+        Stable local tile paths when the manifest and all files cover the
+        request, otherwise ``None`` so online discovery can proceed.
+    """
+    manifest_path = cache / "download_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            metadata.get("dataset_version") != _DATASET_VERSION
+            or metadata.get("year") != year
+        ):
+            return None
+        uris = metadata.get("tile_uris", [])
+        paths = [_local_tile_path(cache, uri) for uri in uris]
+        if not paths or any(
+            not path.is_file() or path.stat().st_size <= 0 for path in paths
+        ):
+            return None
+        cached_boundary_wkt = metadata.get("selection_boundary_wkt")
+        if cached_boundary_wkt:
+            cached_boundary = wkt.loads(cached_boundary_wkt)
+            if cached_boundary.covers(boundary_wgs84):
+                return paths
+            return None
+
+        try:
+            import rasterio
+            from rasterio.warp import transform_bounds
+        except ImportError:
+            return None
+        footprints = []
+        for path in paths:
+            with rasterio.open(path) as source:
+                if source.crs is None:
+                    return None
+                bounds = transform_bounds(
+                    source.crs,
+                    "EPSG:4326",
+                    *source.bounds,
+                    densify_pts=21,
+                )
+                footprints.append(Polygon.from_bounds(*bounds))
+        return paths if unary_union(footprints).covers(boundary_wgs84) else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        logging.warning("Ignoring invalid Open Buildings cache manifest: %s", manifest_path)
+        return None
+
+
 def download_open_buildings_25d(
     boundary: gpd.GeoDataFrame | Any,
     cache_dir: str | Path,
@@ -215,6 +283,15 @@ def download_open_buildings_25d(
     ):
         raise ValueError("max_workers must be an integer from 1 through 8")
     boundary_wgs84 = _boundary_geometry(boundary)
+    cache = Path(cache_dir).expanduser() / str(year)
+    cached_paths = _cached_tile_paths(cache, boundary_wgs84, year)
+    if cached_paths is not None:
+        logging.info(
+            "Reusing %d cached Google Open Buildings 2.5D tile(s) for %s",
+            len(cached_paths), year,
+        )
+        return cached_paths
+
     storage_client = _new_storage_client()
     uris = _selected_tile_uris(storage_client, boundary_wgs84, year)
     if not uris:
@@ -222,7 +299,6 @@ def download_open_buildings_25d(
             f"Google Open Buildings 2.5D has no raster tiles intersecting the "
             f"boundary for {year}; check dataset coverage and boundary CRS"
         )
-    cache = Path(cache_dir).expanduser() / str(year)
     cache.mkdir(parents=True, exist_ok=True)
     destinations = [(uri, _local_tile_path(cache, uri)) for uri in uris]
     with ThreadPoolExecutor(max_workers=min(max_workers, len(destinations))) as executor:
@@ -235,6 +311,7 @@ def download_open_buildings_25d(
         "dataset_version": _DATASET_VERSION,
         "year": year,
         "boundary_crs": "EPSG:4326",
+        "selection_boundary_wkt": boundary_wgs84.wkt,
         "tile_uris": uris,
         "license_options": ["CC-BY-4.0", "ODbL-1.0"],
         "source_url": "https://sites.research.google/gr/open-buildings/temporal",

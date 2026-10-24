@@ -1,7 +1,7 @@
 duckdb
 matplotlib
 geopandas>=0.14
-shapely>=2.0
+shapely>=2.1
 numpy>=1.24
 pandas>=2.0
 pyproj>=3.5
