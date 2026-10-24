@@ -14,19 +14,24 @@ import pickle
 import base64
 import io
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely import coverage_simplify, make_valid
+from shapely import coverage_simplify, intersection, make_valid
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon
 from shapely.ops import nearest_points, polygonize_full, split, unary_union
 
 from opengeomove.taz.exceptions import TAZDependencyError, TAZGeometryError
+from opengeomove.taz.cache import TAZStageCache, path_signature, stable_cache_key
 from opengeomove.taz.models import StudyArea, TAZFrame
 from opengeomove.taz.population import population_cells
 from opengeomove.data_loading.spatial import read_spatial_layer
@@ -42,12 +47,20 @@ class AutomaticTAZConfig:
     for ``building_data_year`` (2016–2023; default 2023) when
     ``building_raster_path`` is not supplied. Downloads are cached under
     ``building_cache_dir`` or ``output_dir/building_rasters``. Outputs are
-    written only when :func:`create_automatic_taz` is called. Plot output
-    supports PNG, PDF, and self-contained HTML previews.
+    written only when :func:`create_automatic_taz` is called. ``cache_mode``
+    controls content-aware GeoParquet caches under ``cache_dir``;
+    ``diagnostics`` controls intermediate exports, and ``n_jobs`` controls
+    independent coarse-zone workers. Workload limits pre-split unusually
+    large or complex coarse zones before detailed recursion. Plot output
+    supports PNG, PDF, and self-contained HTML previews in full diagnostics.
     """
 
     city_name: str = "city"
     output_dir: Path = Path("taz_metis_output")
+    cache_dir: Path | None = None
+    cache_mode: str = "reuse"
+    diagnostics: str = "summary"
+    n_jobs: int = 1
     network_type: str = "drive"
     osm_cache_path: Path | None = None
     building_raster_path: Path | None = None
@@ -60,6 +73,7 @@ class AutomaticTAZConfig:
     building_presence_threshold: float = 0.5
     building_kmeans_n_init: int = 20
     building_max_samples: int = 100_000
+    metis_seed: int = 42
     adaptive_sizing: bool = False
     target_area_km2: float | None = None
     target_population: float | None = None
@@ -97,6 +111,10 @@ class AutomaticTAZConfig:
     # detailed OSM road geometry. Above this size, retain the valid coarse
     # partition instead of repeatedly merging tens of thousands of slivers.
     max_coarse_cleanup_polygons: int = 10_000
+    max_coarse_area_km2: float | None = 40.0
+    max_coarse_road_edges: int | None = 8_000
+    max_coarse_vertices: int | None = 10_000
+    max_coarse_split_depth: int = 8
     node_rounding_decimals: int = 2
     retry_failed_splits_with_enclosed_zones: bool = True
     max_holes_for_failed_split_retry: int = 1
@@ -112,6 +130,7 @@ class AutomaticTAZConfig:
     divider_extension_m: float = 20_000.0
     road_snap_max_distance_m: float = 75.0
     divider_sample_spacing_m: float = 25.0
+    max_divider_samples: int = 256
     max_split_depth: int = 15
     min_child_area_m2: float = 1.0
     figsize: tuple[int, int] = (14, 14)
@@ -121,6 +140,12 @@ class AutomaticTAZConfig:
         """Validate raster bands, area targets, output formats, and split limits."""
         if not isinstance(self.city_name, str) or not self.city_name.strip():
             raise ValueError("city_name must be a non-empty string")
+        if self.cache_mode not in {"reuse", "refresh", "off"}:
+            raise ValueError("cache_mode must be 'reuse', 'refresh', or 'off'")
+        if self.diagnostics not in {"none", "summary", "full"}:
+            raise ValueError("diagnostics must be 'none', 'summary', or 'full'")
+        if isinstance(self.n_jobs, bool) or not isinstance(self.n_jobs, int) or self.n_jobs < 1:
+            raise ValueError("n_jobs must be a positive integer")
         if not isinstance(self.download_google_buildings, bool):
             raise TypeError("download_google_buildings must be a bool")
         if (
@@ -139,6 +164,8 @@ class AutomaticTAZConfig:
             raise ValueError("building raster band indexes are 1-based positive integers")
         if self.building_max_samples < 2 or self.building_kmeans_n_init < 1:
             raise ValueError("building sample and KMeans initialization counts are too small")
+        if isinstance(self.metis_seed, bool) or not isinstance(self.metis_seed, int):
+            raise TypeError("metis_seed must be an integer")
         if not isinstance(self.adaptive_sizing, bool):
             raise TypeError("adaptive_sizing must be a bool")
         if self.target_area_km2 is not None and (
@@ -200,9 +227,44 @@ class AutomaticTAZConfig:
             )
         if self.max_split_depth < 1 or self.max_coarse_cleanup_polygons < 1:
             raise ValueError("split depth and coarse cleanup limit must be positive")
+        if self.max_coarse_area_km2 is not None and (
+            isinstance(self.max_coarse_area_km2, bool)
+            or not math.isfinite(self.max_coarse_area_km2)
+            or self.max_coarse_area_km2 <= 0
+        ):
+            raise ValueError("max_coarse_area_km2 must be positive or None")
+        for name, value in (
+            ("max_coarse_road_edges", self.max_coarse_road_edges),
+            ("max_coarse_vertices", self.max_coarse_vertices),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer or None")
+        if self.max_coarse_split_depth < 1:
+            raise ValueError("max_coarse_split_depth must be positive")
+        if self.max_divider_samples < 2:
+            raise ValueError("max_divider_samples must be at least 2")
 
 
 Config = AutomaticTAZConfig
+
+_PREPARED_STAGE_CACHE_VERSION = 2
+_FINAL_RESULT_CACHE_VERSION = 6
+_PYMETIS_LOCK = Lock()
+_NON_ALGORITHM_CONFIG_FIELDS = {
+    "output_dir",
+    "cache_dir",
+    "cache_mode",
+    "diagnostics",
+    "n_jobs",
+    "save_plots",
+    "plot_formats",
+    "show_plots",
+    "figsize",
+    "metadata",
+    "export_crs",
+}
 
 
 @dataclass
@@ -214,6 +276,73 @@ class _AdaptiveEvidence:
     city_building_density: float | None = None
     population_cache: dict[bytes, float] = field(default_factory=dict)
     building_density_cache: dict[bytes, float] = field(default_factory=dict)
+
+
+def _frame_signature(frame: gpd.GeoDataFrame) -> dict[str, Any]:
+    """Return a stable content signature for an in-memory spatial input."""
+    digest = sha256()
+    digest.update(str(frame.crs).encode("utf-8"))
+    for geometry in frame.geometry:
+        digest.update(b"<null>" if geometry is None else geometry.wkb)
+    attributes = frame.drop(columns=[frame.geometry.name], errors="ignore")
+    if len(attributes.columns):
+        hashed = pd.util.hash_pandas_object(
+            attributes.astype(str), index=True
+        ).to_numpy()
+        digest.update(hashed.tobytes())
+    return {"kind": "geodataframe", "rows": len(frame), "sha256": digest.hexdigest()}
+
+
+def _input_signature(value: Any) -> dict[str, Any]:
+    """Describe a path-backed or in-memory automatic-TAZ input."""
+    if value is None:
+        return {"kind": "none"}
+    if isinstance(value, (str, Path)):
+        return {"kind": "path", **path_signature(value)}
+    if isinstance(value, gpd.GeoDataFrame):
+        return _frame_signature(value)
+    cells = getattr(value, "cells", None)
+    if isinstance(cells, gpd.GeoDataFrame):
+        return {
+            "kind": type(value).__name__,
+            "cells": _frame_signature(cells),
+            "value_column": getattr(value, "value_column", None),
+            "source": getattr(value, "source", None),
+        }
+    return {"kind": type(value).__name__, "cacheable": False}
+
+
+def _boundary_signature(boundary: gpd.GeoDataFrame) -> dict[str, Any]:
+    """Fingerprint a normalized WGS84 study boundary."""
+    geometry = boundary.to_crs("EPSG:4326").geometry.union_all().normalize()
+    return {
+        "crs": "EPSG:4326",
+        "sha256": sha256(geometry.wkb).hexdigest(),
+    }
+
+
+def _config_signature(
+    cfg: AutomaticTAZConfig,
+    *,
+    fields: set[str] | None = None,
+) -> dict[str, Any]:
+    """Select JSON-compatible algorithm settings for cache invalidation."""
+    selected = fields or (
+        set(AutomaticTAZConfig.__dataclass_fields__) - _NON_ALGORITHM_CONFIG_FIELDS
+    )
+    return {
+        name: getattr(cfg, name)
+        for name in sorted(selected)
+    }
+
+
+def _fresh_evidence(evidence: _AdaptiveEvidence) -> _AdaptiveEvidence:
+    """Create task-local evidence caches while sharing immutable source rows."""
+    return _AdaptiveEvidence(
+        population=evidence.population,
+        buildings=evidence.buildings,
+        city_building_density=evidence.city_building_density,
+    )
 
 
 def _require_networkx():
@@ -405,8 +534,32 @@ def _gdf(geometries, crs) -> gpd.GeoDataFrame:
     )
 
 
-def _export_layer(layer: gpd.GeoDataFrame, path: Path, cfg: AutomaticTAZConfig) -> Path:
-    """Write one intermediate vector layer in the configured export CRS."""
+def _export_layer(
+    layer: gpd.GeoDataFrame,
+    path: Path,
+    cfg: AutomaticTAZConfig,
+    *,
+    level: str = "full",
+) -> Path:
+    """Write a vector layer when its diagnostic level is enabled.
+
+    Args:
+        layer: Spatial rows to export.
+        path: GeoJSON destination.
+        cfg: Automatic TAZ configuration.
+        level: ``"full"`` for detailed intermediates, ``"summary"`` for
+            compact diagnostics, or ``"always"`` for the final result.
+
+    Returns:
+        The requested destination path, whether or not it was written.
+    """
+    enabled = (
+        level == "always"
+        or cfg.diagnostics == "full"
+        or (level == "summary" and cfg.diagnostics == "summary")
+    )
+    if not enabled:
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
     output = layer.to_crs(cfg.export_crs)
     output.to_file(path, driver="GeoJSON")
@@ -416,7 +569,7 @@ def _export_layer(layer: gpd.GeoDataFrame, path: Path, cfg: AutomaticTAZConfig) 
 
 def _plot_layers(stem: Path, cfg: AutomaticTAZConfig, layers, title: str) -> None:
     """Render a diagnostic layer stack to a static PNG when requested."""
-    if not cfg.save_plots and not cfg.show_plots:
+    if cfg.diagnostics != "full" or (not cfg.save_plots and not cfg.show_plots):
         return
     import matplotlib.pyplot as plt
 
@@ -544,10 +697,13 @@ def _prune_terminal_branches(lines: gpd.GeoDataFrame, maximum: float, decimals: 
     return working
 
 
-def _sample_line(line: LineString, spacing: float):
-    """Interpolate points at a bounded spacing along a line."""
+def _sample_line(line: LineString, spacing: float, maximum: int | None = None):
+    """Interpolate a bounded number of evenly spaced points along a line."""
+    count = max(2, int(np.ceil(line.length / spacing)) + 1)
+    if maximum is not None:
+        count = min(count, maximum)
     return [line.interpolate(distance) for distance in np.linspace(
-        0, line.length, max(2, int(np.ceil(line.length / spacing)) + 1)
+        0, line.length, count
     )]
 
 
@@ -557,7 +713,11 @@ def _aligned_divider(divider: LineString, roads: gpd.GeoDataFrame, cfg):
         return divider
     road_union = roads.geometry.union_all()
     coords = []
-    for point in _sample_line(divider, cfg.divider_sample_spacing_m):
+    for point in _sample_line(
+        divider,
+        cfg.divider_sample_spacing_m,
+        cfg.max_divider_samples,
+    ):
         if point.distance(road_union) <= cfg.road_snap_max_distance_m:
             _, snapped = nearest_points(point, road_union)
             coords.append((snapped.x, snapped.y))
@@ -565,6 +725,58 @@ def _aligned_divider(divider: LineString, roads: gpd.GeoDataFrame, cfg):
             coords.append((point.x, point.y))
     deduped = [coord for i, coord in enumerate(coords) if i == 0 or coord != coords[i - 1]]
     return LineString(deduped) if len(deduped) >= 2 else divider
+
+
+def _clip_roads_to_geometry(
+    roads: gpd.GeoDataFrame,
+    geometry: Any,
+) -> gpd.GeoDataFrame:
+    """Return roads clipped to a polygon while preserving contained features.
+
+    A spatial-index query first removes unrelated roads. Features already
+    covered by the polygon are retained without an expensive intersection;
+    only boundary-crossing features are geometrically clipped. This is much
+    cheaper than applying ``geopandas.clip`` to every feature at every
+    recursive node.
+
+    Args:
+        roads: Road features in the same CRS as ``geometry``.
+        geometry: Polygonal parent or child zone.
+
+    Returns:
+        A reset-index copy containing non-empty line geometry inside the zone.
+    """
+    if roads.empty:
+        return roads.copy().reset_index(drop=True)
+    intersecting = np.sort(
+        np.asarray(roads.sindex.query(geometry, predicate="intersects"), dtype=int)
+    )
+    if not len(intersecting):
+        return roads.iloc[0:0].copy().reset_index(drop=True)
+    contained = np.asarray(
+        roads.sindex.query(geometry, predicate="covers"), dtype=int
+    )
+    candidates = roads.iloc[intersecting].copy()
+    inside = np.isin(intersecting, contained, assume_unique=False)
+    crossing_positions = np.flatnonzero(~inside)
+    if len(crossing_positions):
+        clipped = intersection(
+            candidates.geometry.iloc[crossing_positions].array,
+            geometry,
+        )
+        candidates.loc[
+            candidates.index[crossing_positions], candidates.geometry.name
+        ] = gpd.GeoSeries(
+            clipped,
+            index=candidates.index[crossing_positions],
+            crs=roads.crs,
+        )
+    candidates = candidates[
+        candidates.geometry.notna()
+        & ~candidates.geometry.is_empty
+        & candidates.geometry.geom_type.isin(["LineString", "MultiLineString"])
+    ]
+    return candidates.reset_index(drop=True)
 
 
 def _split_all(parent: Polygon, divider: LineString, minimum: float):
@@ -809,11 +1021,10 @@ def _evidence_subset(
     """Return evidence points covered by one candidate zone."""
     if points is None or points.empty:
         return points.iloc[0:0] if points is not None else gpd.GeoDataFrame()
-    positions = points.sindex.query(geometry, predicate="intersects")
+    positions = points.sindex.query(geometry, predicate="covers")
     if not len(positions):
         return points.iloc[0:0]
-    candidates = points.iloc[positions]
-    return candidates[candidates.geometry.map(geometry.covers)]
+    return points.iloc[positions]
 
 
 def _zone_population(geometry: Any, evidence: _AdaptiveEvidence | None) -> float | None:
@@ -1146,9 +1357,23 @@ def _divider_from_axis(parent: Polygon, midpoint: Point, axis, cfg):
     midpoint = midpoint if parent.covers(midpoint) else parent.representative_point()
     ux, uy = axis / norm
     px, py = -uy, ux
+    minx, miny, maxx, maxy = parent.bounds
+    required = max(
+        math.hypot(x - midpoint.x, y - midpoint.y)
+        for x, y in (
+            (minx, miny),
+            (minx, maxy),
+            (maxx, miny),
+            (maxx, maxy),
+        )
+    ) + cfg.road_snap_max_distance_m
+    extension = max(
+        cfg.road_snap_max_distance_m * 2.0,
+        min(cfg.divider_extension_m, required),
+    )
     return LineString([
-        (midpoint.x - px * cfg.divider_extension_m, midpoint.y - py * cfg.divider_extension_m),
-        (midpoint.x + px * cfg.divider_extension_m, midpoint.y + py * cfg.divider_extension_m),
+        (midpoint.x - px * extension, midpoint.y - py * extension),
+        (midpoint.x + px * extension, midpoint.y + py * extension),
     ])
 
 
@@ -1192,11 +1417,23 @@ def _combined_divider(parent, c0, c1, building, cfg):
     return divider, info
 
 
-def _metis_split(parent, local_roads, crs, cfg, evidence=None):
+def _metis_split(
+    parent,
+    local_roads,
+    crs,
+    cfg,
+    evidence=None,
+    *,
+    roads_clipped=False,
+):
     """Partition a clipped road graph and construct a road-aligned divider."""
     nx = _require_networkx()
     pymetis = _require_pymetis()
-    roads = gpd.clip(local_roads, _gdf([parent], crs))
+    roads = (
+        local_roads.reset_index(drop=True)
+        if roads_clipped
+        else _clip_roads_to_geometry(local_roads, parent)
+    )
     segments = _lines(unary_union(list(roads.geometry))) if not roads.empty else []
     graph = nx.Graph()
     for segment in segments:
@@ -1214,9 +1451,19 @@ def _metis_split(parent, local_roads, crs, cfg, evidence=None):
     nodes = list(graph.nodes())
     node_index = {node: i for i, node in enumerate(nodes)}
     try:
-        _, membership = pymetis.part_graph(
-            2, adjacency=[[node_index[n] for n in graph.neighbors(node)] for node in nodes]
-        )
+        adjacency = [
+            [node_index[neighbor] for neighbor in graph.neighbors(node)]
+            for node in nodes
+        ]
+        # PyMETIS exposes process-global native state in some builds. Serialize
+        # calls across coarse-zone worker threads and seed every partition so
+        # parallel execution remains reproducible.
+        with _PYMETIS_LOCK:
+            _, membership = pymetis.part_graph(
+                2,
+                adjacency=adjacency,
+                options=pymetis.Options(seed=cfg.metis_seed),
+            )
     except Exception as exc:
         return None, f"metis_error:{exc}", roads
     groups = [[Point(nodes[i]) for i in range(len(nodes)) if membership[i] == label] for label in (0, 1)]
@@ -1263,7 +1510,15 @@ def _metis_split(parent, local_roads, crs, cfg, evidence=None):
     return None, "metis_divider_did_not_make_two_children", roads
 
 
-def _building_split(parent, local_roads, crs, cfg, evidence=None):
+def _building_split(
+    parent,
+    local_roads,
+    crs,
+    cfg,
+    evidence=None,
+    *,
+    roads_clipped=False,
+):
     """Split from building clusters when a usable road graph is unavailable."""
     building = _building_cluster_centers(parent, crs, cfg, evidence)
     if building is None:
@@ -1275,7 +1530,11 @@ def _building_split(parent, local_roads, crs, cfg, evidence=None):
     )
     if divider is None:
         return None, "identical_building_centroids"
-    roads = gpd.clip(local_roads, _gdf([parent], crs))
+    roads = (
+        local_roads.reset_index(drop=True)
+        if roads_clipped
+        else _clip_roads_to_geometry(local_roads, parent)
+    )
     hybrid = _aligned_divider(divider, roads, cfg)
     winner = _select_split_candidate([
         {
@@ -1302,19 +1561,29 @@ def _building_split(parent, local_roads, crs, cfg, evidence=None):
     return None, "building_divider_did_not_make_two_children"
 
 
-def _oriented_split(parent, local_roads, crs, cfg, evidence=None):
+def _oriented_split(
+    parent,
+    local_roads,
+    crs,
+    cfg,
+    evidence=None,
+    *,
+    roads_clipped=False,
+):
     """Split a polygon along its principal axis, optionally snapping to roads."""
     hull = parent.convex_hull
     coords = np.asarray(hull.exterior.coords)[:, :2]
     _, vectors = np.linalg.eigh(np.cov((coords - coords.mean(axis=0)).T))
     ux, uy = vectors[:, -1]
     point = parent.representative_point()
-    px, py = -uy, ux
-    straight = LineString([
-        (point.x - px * cfg.divider_extension_m, point.y - py * cfg.divider_extension_m),
-        (point.x + px * cfg.divider_extension_m, point.y + py * cfg.divider_extension_m),
-    ])
-    roads = gpd.clip(local_roads, _gdf([parent], crs))
+    straight = _divider_from_axis(parent, point, [ux, uy], cfg)
+    if straight is None:
+        return None
+    roads = (
+        local_roads.reset_index(drop=True)
+        if roads_clipped
+        else _clip_roads_to_geometry(local_roads, parent)
+    )
     hybrid = _aligned_divider(straight, roads, cfg)
     aligned_raw = _split_all(parent, hybrid, cfg.min_child_area_m2)
     straight_raw = _split_all(parent, straight, cfg.min_child_area_m2)
@@ -1345,6 +1614,123 @@ def _oriented_split(parent, local_roads, crs, cfg, evidence=None):
             "roads": roads,
         })
     return _select_split_candidate(candidates, cfg, evidence)
+
+
+def _geometry_vertex_count(geometry: Any) -> int:
+    """Count exterior and interior polygon coordinates recursively."""
+    return sum(
+        len(polygon.exterior.coords)
+        + sum(len(ring.coords) for ring in polygon.interiors)
+        for polygon in _polygons(geometry)
+    )
+
+
+def _coarse_workload_exceeded(
+    geometry: Any,
+    roads: gpd.GeoDataFrame,
+    cfg: AutomaticTAZConfig,
+) -> bool:
+    """Return whether a coarse zone exceeds any configured workload limit."""
+    return any((
+        cfg.max_coarse_area_km2 is not None
+        and geometry.area / 1_000_000.0 > cfg.max_coarse_area_km2,
+        cfg.max_coarse_road_edges is not None
+        and len(roads) > cfg.max_coarse_road_edges,
+        cfg.max_coarse_vertices is not None
+        and _geometry_vertex_count(geometry) > cfg.max_coarse_vertices,
+    ))
+
+
+def _balance_coarse_workloads(
+    coarse: gpd.GeoDataFrame,
+    local_roads: gpd.GeoDataFrame,
+    crs: Any,
+    cfg: AutomaticTAZConfig,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Road-align bisections until coarse-zone workloads are bounded.
+
+    Args:
+        coarse: Valid coarse study-area partition.
+        local_roads: Local road features in the same projected CRS.
+        crs: Projected workflow CRS.
+        cfg: Coarse area, road-count, vertex-count, and depth limits.
+
+    Returns:
+        A balanced coarse partition and accepted workload dividers. A zone is
+        retained with ``workload_limit_reached=True`` if no valid split is
+        available before the configured depth limit.
+    """
+    records: list[dict[str, Any]] = []
+    dividers: list[dict[str, Any]] = []
+
+    def visit(
+        geometry: Any,
+        roads: gpd.GeoDataFrame,
+        parent_id: int,
+        depth: int,
+    ) -> None:
+        """Recursively split one coarse workload while retaining provenance."""
+        exceeded = _coarse_workload_exceeded(geometry, roads, cfg)
+        if not exceeded or depth >= cfg.max_coarse_split_depth:
+            records.append({
+                "geometry": geometry,
+                "coarse_parent_id": parent_id,
+                "coarse_split_depth": depth,
+                "coarse_road_edges": len(roads),
+                "coarse_vertices": _geometry_vertex_count(geometry),
+                "workload_limit_reached": bool(exceeded),
+            })
+            return
+        info = _oriented_split(
+            geometry,
+            roads,
+            crs,
+            cfg,
+            evidence=None,
+            roads_clipped=True,
+        )
+        if info is None or len(info["children"]) < 2:
+            records.append({
+                "geometry": geometry,
+                "coarse_parent_id": parent_id,
+                "coarse_split_depth": depth,
+                "coarse_road_edges": len(roads),
+                "coarse_vertices": _geometry_vertex_count(geometry),
+                "workload_limit_reached": True,
+            })
+            return
+        dividers.append({
+            "geometry": info["divider"],
+            "coarse_parent_id": parent_id,
+            "coarse_split_depth": depth,
+            "method": info["method"],
+            "split_quality": info["split_quality"],
+        })
+        for child in info["children"]:
+            visit(
+                child,
+                _clip_roads_to_geometry(roads, child),
+                parent_id,
+                depth + 1,
+            )
+
+    for parent_id, geometry in enumerate(coarse.geometry):
+        visit(
+            geometry,
+            _clip_roads_to_geometry(local_roads, geometry),
+            parent_id,
+            0,
+        )
+    balanced = _normalize_polygon_frame(
+        gpd.GeoDataFrame(records, geometry="geometry", crs=crs),
+        stage="workload-balanced coarse partition",
+    ).reset_index(drop=True)
+    balanced["coarse_zone_id"] = range(len(balanced))
+    divider_frame = (
+        gpd.GeoDataFrame(dividers, geometry="geometry", crs=crs)
+        if dividers else _gdf([], crs)
+    )
+    return balanced, divider_frame
 
 
 def _adaptive_split_decision(
@@ -1419,7 +1805,16 @@ def _record_evidence(decision: dict[str, Any]) -> dict[str, Any]:
 
 
 def _oriented_recursive(
-    parent, roads, crs, cfg, coarse_id, depth, failure, evidence=None
+    parent,
+    roads,
+    crs,
+    cfg,
+    coarse_id,
+    depth,
+    failure,
+    evidence=None,
+    *,
+    roads_clipped=False,
 ):
     """Recursively apply the oriented fallback and retain failure metadata."""
     decision = _adaptive_split_decision(parent, cfg, evidence)
@@ -1435,7 +1830,14 @@ def _oriented_recursive(
     if current < cfg.final_min_area_km2 or depth >= cfg.max_split_depth:
         status = "oriented_undersized" if current < cfg.final_min_area_km2 else "oriented_max_depth"
         return [{**base, "geometry": parent, "status": status, "split_method": "oriented", "failure_reason": failure}], []
-    info = _oriented_split(parent, roads, crs, cfg, evidence)
+    info = _oriented_split(
+        parent,
+        roads,
+        crs,
+        cfg,
+        evidence,
+        roads_clipped=roads_clipped,
+    )
     if info is None:
         return [{**base, "geometry": parent, "status": "oriented_split_failed", "split_method": "oriented", "failure_reason": failure}], []
     divider = {"geometry": info["divider"], "coarse_zone_id": coarse_id, "depth": depth,
@@ -1446,10 +1848,19 @@ def _oriented_recursive(
         "split_evidence_balance", "split_road_bonus",
     )})
     records, dividers = [], [divider]
-    child_roads = info.get("roads", roads)
+    parent_roads = info.get("roads", roads)
     for child in info["children"]:
+        child_roads = _clip_roads_to_geometry(parent_roads, child)
         child_records, child_dividers = _oriented_recursive(
-            child, child_roads, crs, cfg, coarse_id, depth + 1, failure, evidence
+            child,
+            child_roads,
+            crs,
+            cfg,
+            coarse_id,
+            depth + 1,
+            failure,
+            evidence,
+            roads_clipped=True,
         )
         records.extend(child_records)
         dividers.extend(child_dividers)
@@ -1457,7 +1868,16 @@ def _oriented_recursive(
 
 
 def _building_recursive(
-    parent, roads, crs, cfg, coarse_id, depth, failure, evidence=None
+    parent,
+    roads,
+    crs,
+    cfg,
+    coarse_id,
+    depth,
+    failure,
+    evidence=None,
+    *,
+    roads_clipped=False,
 ):
     """Try building-only recursion, then retain the PCA fallback."""
     decision = _adaptive_split_decision(parent, cfg, evidence)
@@ -1489,13 +1909,27 @@ def _building_recursive(
             parent, roads, crs, cfg, coarse_id, depth,
             f"{failure};building_max_depth",
             evidence,
+            roads_clipped=roads_clipped,
         )
-    info, building_failure = _building_split(parent, roads, crs, cfg, evidence)
+    parent_roads = (
+        roads.reset_index(drop=True)
+        if roads_clipped
+        else _clip_roads_to_geometry(roads, parent)
+    )
+    info, building_failure = _building_split(
+        parent,
+        parent_roads,
+        crs,
+        cfg,
+        evidence,
+        roads_clipped=True,
+    )
     if info is None:
         return _oriented_recursive(
-            parent, roads, crs, cfg, coarse_id, depth,
+            parent, parent_roads, crs, cfg, coarse_id, depth,
             f"{failure};{building_failure}",
             evidence,
+            roads_clipped=True,
         )
     divider = {
         "geometry": info["divider"],
@@ -1511,8 +1945,17 @@ def _building_recursive(
     )})
     records, dividers = [], [divider]
     for child in info["children"]:
+        child_roads = _clip_roads_to_geometry(parent_roads, child)
         child_records, child_dividers = _building_recursive(
-            child, roads, crs, cfg, coarse_id, depth + 1, failure, evidence
+            child,
+            child_roads,
+            crs,
+            cfg,
+            coarse_id,
+            depth + 1,
+            failure,
+            evidence,
+            roads_clipped=True,
         )
         records.extend(child_records)
         dividers.extend(child_dividers)
@@ -1520,7 +1963,15 @@ def _building_recursive(
 
 
 def _recursive_split(
-    parent, roads, crs, cfg, coarse_id, depth=0, evidence=None
+    parent,
+    roads,
+    crs,
+    cfg,
+    coarse_id,
+    depth=0,
+    evidence=None,
+    *,
+    roads_clipped=False,
 ):
     """Recursively split one coarse polygon using METIS and fallback methods."""
     decision = _adaptive_split_decision(parent, cfg, evidence)
@@ -1537,15 +1988,38 @@ def _recursive_split(
         return [{**base, "geometry": parent, "status": "undersized", "split_method": "none", "failure_reason": "below_minimum_before_split"}], []
     if depth >= cfg.max_split_depth:
         return [{**base, "geometry": parent, "status": "max_depth", "split_method": "none", "failure_reason": "max_depth_reached"}], []
-    info, reason, parent_roads = _metis_split(parent, roads, crs, cfg, evidence)
+    info, reason, parent_roads = _metis_split(
+        parent,
+        roads,
+        crs,
+        cfg,
+        evidence,
+        roads_clipped=roads_clipped,
+    )
     if info is None:
         if decision["should_split"] or current > cfg.oriented_fallback_trigger_km2:
             if cfg.building_raster_path is not None:
                 return _building_recursive(
-                    parent, parent_roads, crs, cfg, coarse_id, depth, reason, evidence
+                    parent,
+                    parent_roads,
+                    crs,
+                    cfg,
+                    coarse_id,
+                    depth,
+                    reason,
+                    evidence,
+                    roads_clipped=True,
                 )
             return _oriented_recursive(
-                parent, parent_roads, crs, cfg, coarse_id, depth, reason, evidence
+                parent,
+                parent_roads,
+                crs,
+                cfg,
+                coarse_id,
+                depth,
+                reason,
+                evidence,
+                roads_clipped=True,
             )
         return [{**base, "geometry": parent, "status": "split_failed", "split_method": "none", "failure_reason": reason}], []
     divider = {"geometry": info["divider"], "coarse_zone_id": coarse_id, "depth": depth,
@@ -1557,8 +2031,16 @@ def _recursive_split(
     )})
     records, dividers = [], [divider]
     for child in info["children"]:
+        child_roads = _clip_roads_to_geometry(parent_roads, child)
         child_records, child_dividers = _recursive_split(
-            child, parent_roads, crs, cfg, coarse_id, depth + 1, evidence
+            child,
+            child_roads,
+            crs,
+            cfg,
+            coarse_id,
+            depth + 1,
+            evidence,
+            roads_clipped=True,
         )
         records.extend(child_records)
         dividers.extend(child_dividers)
@@ -1804,6 +2286,184 @@ def _load_edges(graph, boundary: gpd.GeoDataFrame, cfg: AutomaticTAZConfig):
     return ox.graph_to_gdfs(graph, nodes=False, edges=True)
 
 
+def _build_coarse_partition(
+    city: gpd.GeoDataFrame,
+    city_m: gpd.GeoDataFrame,
+    city_geom: Any,
+    major: gpd.GeoDataFrame,
+    local: gpd.GeoDataFrame,
+    metric_crs: Any,
+    cfg: AutomaticTAZConfig,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Build and workload-balance the road/natural-feature coarse partition.
+
+    Args:
+        city: Study boundary in its source CRS.
+        city_m: Study boundary in the projected workflow CRS.
+        city_geom: Dissolved projected study boundary.
+        major: Major roads used as coarse barriers.
+        local: Local roads used to bound recursive workloads.
+        metric_crs: Projected workflow CRS.
+        cfg: Automatic TAZ configuration and diagnostic settings.
+
+    Returns:
+        Workload-balanced coarse zones and the accepted balancing dividers.
+    """
+    _export_layer(city_m, cfg.output_dir / "00_boundary.geojson", cfg)
+    _export_layer(major, cfg.output_dir / "01_major_roads.geojson", cfg)
+    _export_layer(local, cfg.output_dir / "02_local_roads.geojson", cfg)
+    major_corridors, major_centerlines = _centerlines(
+        major, cfg.major_road_buffer_m, cfg
+    )
+    _export_layer(
+        major_corridors,
+        cfg.output_dir / "03_major_road_corridors.geojson",
+        cfg,
+    )
+    _export_layer(
+        major_centerlines,
+        cfg.output_dir / "04_major_road_centerlines.geojson",
+        cfg,
+    )
+    road_polygons, road_dangles = _polygonize(
+        major_centerlines, city_geom, metric_crs
+    )
+    road_barriers = road_polygons[
+        road_polygons.area_km2 >= cfg.barrier_min_area_km2
+    ].copy()
+    road_barriers.geometry = road_barriers.boundary
+    _export_layer(road_polygons, cfg.output_dir / "05_major_road_polygons.geojson", cfg)
+    _export_layer(road_dangles, cfg.output_dir / "05a_major_road_dangles.geojson", cfg)
+    _export_layer(road_barriers, cfg.output_dir / "06_major_road_barriers.geojson", cfg)
+
+    natural = _gdf([], metric_crs)
+    if cfg.fetch_railways_and_waterways:
+        try:
+            import osmnx as ox
+
+            features = ox.features_from_polygon(
+                city.to_crs(cfg.export_crs).geometry.iloc[0],
+                tags={"railway": True, "waterway": True},
+            )
+            if features is not None and not features.empty:
+                features = gpd.clip(features.to_crs(metric_crs), city_m)
+                linear = features.geometry.geom_type.isin(
+                    ["LineString", "MultiLineString"]
+                )
+                railway = features[
+                    linear
+                    & features.get(
+                        "railway", pd.Series(index=features.index, dtype="object")
+                    ).isin(cfg.railway_types)
+                ]
+                water = features[
+                    linear
+                    & features.get(
+                        "waterway", pd.Series(index=features.index, dtype="object")
+                    ).notna()
+                ]
+                natural = gpd.GeoDataFrame(
+                    pd.concat(
+                        [railway[["geometry"]], water[["geometry"]]],
+                        ignore_index=True,
+                    ),
+                    geometry="geometry",
+                    crs=metric_crs,
+                )
+        except Exception as exc:
+            logging.warning(
+                "Natural-feature retrieval failed; continuing with roads: %s", exc
+            )
+    natural_corridors, natural_centerlines = _centerlines(
+        natural, cfg.barrier_buffer_m, cfg
+    )
+    natural_polygons, natural_dangles = _polygonize(
+        natural_centerlines, city_geom, metric_crs
+    )
+    natural_barriers = natural_polygons[
+        natural_polygons.area_km2 >= cfg.barrier_min_area_km2
+    ].copy()
+    natural_barriers.geometry = natural_barriers.boundary
+    for name, frame in [
+        ("07_raw_railway_waterway_lines", natural),
+        ("08_railway_waterway_corridors", natural_corridors),
+        ("09_railway_waterway_centerlines", natural_centerlines),
+        ("09a_railway_waterway_dangles", natural_dangles),
+        ("10_railway_waterway_barriers", natural_barriers),
+    ]:
+        _export_layer(frame, cfg.output_dir / f"{name}.geojson", cfg)
+
+    barrier_lines = gpd.GeoDataFrame(
+        pd.concat(
+            [road_barriers[["geometry"]], natural_barriers[["geometry"]]],
+            ignore_index=True,
+        ),
+        geometry="geometry",
+        crs=metric_crs,
+    )
+    first_coarse, first_dangles = _polygonize(
+        barrier_lines, city_geom, metric_crs
+    )
+    first_coarse = _normalize_polygon_frame(
+        _merge_small(first_coarse, cfg.coarse_min_area_km2),
+        stage="initial coarse partition",
+    )
+    boundary_gdf = _gdf(list(first_coarse.boundary), metric_crs)
+    coarse_corridors, coarse_centerlines = _centerlines(
+        boundary_gdf, cfg.coarse_boundary_buffer_m, cfg
+    )
+    cleaned_centerlines = _prune_terminal_branches(
+        coarse_centerlines,
+        cfg.max_dangle_length_m,
+        cfg.node_rounding_decimals,
+    )
+    cleanup_candidate, cleaned_dangles = _polygonize(
+        cleaned_centerlines, city_geom, metric_crs
+    )
+    if len(cleanup_candidate) > cfg.max_coarse_cleanup_polygons:
+        coarse, save_candidate = first_coarse.copy().reset_index(drop=True), False
+    else:
+        coarse = _merge_small(
+            cleanup_candidate, cfg.coarse_min_area_km2
+        ).reset_index(drop=True)
+        save_candidate = True
+    coarse = _normalize_polygon_frame(coarse, stage="coarse partition")
+    _validate_partition(coarse, city_geom, stage="coarse partition")
+    for name, frame in [
+        ("11_initial_coarse_zones", first_coarse),
+        ("11a_initial_coarse_dangles", first_dangles),
+        ("12_coarse_boundary_corridors", coarse_corridors),
+        ("13_coarse_boundary_centerlines_raw", coarse_centerlines),
+        ("14_coarse_boundary_centerlines_dangle_pruned", cleaned_centerlines),
+        ("14a_coarse_polygonize_dangles", cleaned_dangles),
+    ]:
+        _export_layer(frame, cfg.output_dir / f"{name}.geojson", cfg)
+    if save_candidate:
+        _export_layer(
+            cleanup_candidate,
+            cfg.output_dir / "14b_coarse_cleanup_candidate.geojson",
+            cfg,
+        )
+    _export_layer(
+        coarse,
+        cfg.output_dir / "15a_unbalanced_coarse_zones.geojson",
+        cfg,
+    )
+    balanced, workload_dividers = _balance_coarse_workloads(
+        coarse, local, metric_crs, cfg
+    )
+    _validate_partition(
+        balanced, city_geom, stage="workload-balanced coarse partition"
+    )
+    _export_layer(balanced, cfg.output_dir / "15_coarse_zones.geojson", cfg)
+    _export_layer(
+        workload_dividers,
+        cfg.output_dir / "15b_coarse_workload_dividers.geojson",
+        cfg,
+    )
+    return balanced, workload_dividers
+
+
 def create_automatic_taz(
     boundary: Any,
     graph: Any = None,
@@ -1835,8 +2495,10 @@ def create_automatic_taz(
         **overrides: Fields that replace values on ``config``.
 
     Returns:
-        A TAZFrame. Intermediate GeoJSON layers and requested static plots are
-        written under ``config.output_dir`` as part of this explicit workflow.
+        A TAZFrame. The final GeoJSON and run manifest are written under
+        ``config.output_dir``. Additional intermediate layers and static plots
+        follow the configured diagnostics level. Matching prepared/final cache
+        entries are reused according to ``cache_mode``.
 
     Raises:
         TypeError: If an override is not a configuration field.
@@ -1857,6 +2519,11 @@ def create_automatic_taz(
     base_config = config if config is not None else AutomaticTAZConfig()
     cfg = replace(base_config, **overrides)
     cfg.output_dir = Path(cfg.output_dir)
+    cfg.cache_dir = (
+        Path(cfg.cache_dir)
+        if cfg.cache_dir is not None
+        else cfg.output_dir / "cache"
+    )
     if cfg.building_presence_threshold < 0 or cfg.building_presence_threshold > 1:
         raise ValueError("building_presence_threshold must be between 0 and 1")
     if cfg.final_min_area_km2 <= 0 or cfg.final_max_area_km2 < cfg.final_min_area_km2:
@@ -1871,9 +2538,15 @@ def create_automatic_taz(
         logging.info("Using %d building raster tile(s) from %s", len(raster_paths), cfg.building_raster_path)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     plots = cfg.output_dir / "plots"
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+    cache_hits: list[str] = []
+    cache = TAZStageCache(cfg.cache_dir, cfg.cache_mode)
     city = _load_boundary(boundary)
+    boundary_key = _boundary_signature(city)
     building_source = "local" if cfg.building_raster_path is not None else None
     building_download_info = None
+    stage_started = time.perf_counter()
     if cfg.download_google_buildings and cfg.building_raster_path is None:
         from opengeomove.data_loading.google_buildings import (
             download_open_buildings_25d,
@@ -1902,26 +2575,118 @@ def create_automatic_taz(
             "Using %d cached Google 2.5D raster tile(s) from %s",
             len(downloaded_tiles), raster_cache,
         )
+    timings["input_resolution_s"] = time.perf_counter() - stage_started
     metric_crs = city.estimate_utm_crs()
     if metric_crs is None:
         raise TAZGeometryError("Could not estimate a metric CRS for the boundary")
     city_m = city.to_crs(metric_crs)
     city_geom = city_m.geometry.union_all()
+
+    graph_source = (
+        _road_edge_cache_path(cfg) if graph is None else graph
+    )
+    graph_signature = _input_signature(graph_source)
+    population_signature = _input_signature(population)
+    building_signature = path_signature(cfg.building_raster_path)
+    final_config_signature = _config_signature(cfg)
+    final_key = stable_cache_key({
+        "algorithm_version": _FINAL_RESULT_CACHE_VERSION,
+        "boundary": boundary_key,
+        "graph": graph_signature,
+        "population": population_signature,
+        "buildings": building_signature,
+        "config": final_config_signature,
+    })
+    cached_final = cache.load_frame("final", final_key)
+    if cached_final is not None:
+        cached_metadata = cache.load_json("final", final_key) or {}
+        metadata = dict(cached_metadata.get("metadata", {}))
+        metadata.update({
+            "automatic_taz_config": cfg,
+            "output_dir": str(cfg.output_dir),
+            "cache_mode": cfg.cache_mode,
+            "cache_hit": "final",
+            "cache_key": final_key,
+            "elapsed_s": time.perf_counter() - started,
+        })
+        logging.info(
+            "Reusing %d final TAZ(s) from cache key %s",
+            len(cached_final), final_key,
+        )
+        _export_layer(
+            cached_final,
+            cfg.output_dir / "17_final_tazs_with_status.geojson",
+            cfg,
+            level="always",
+        )
+        cached_manifest = {
+            "algorithm_version": _FINAL_RESULT_CACHE_VERSION,
+            "prepared_stage_cache_version": _PREPARED_STAGE_CACHE_VERSION,
+            "cache_key": final_key,
+            "cache_hit": "final",
+            "cache_hits": metadata.get("cache_hits", []),
+            "config": final_config_signature,
+            "timings_s": metadata.get("timings_s", {}),
+            "coarse_timings": metadata.get("coarse_timings", []),
+            "input_zone_count": metadata.get("coarse_zone_count"),
+            "output_zone_count": int(len(cached_final)),
+            "cache_lookup_elapsed_s": metadata["elapsed_s"],
+        }
+        (cfg.output_dir / "run_manifest.json").write_text(
+            json.dumps(cached_manifest, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        return TAZFrame(cached_final, metadata)
+
     population_data = None
     if population is not None:
-        population_data = population_cells(
-            population,
-            population_column=cfg.population_column,
-            target_crs=metric_crs,
-            boundary=city_geom,
-        )
+        population_key = stable_cache_key({
+            "boundary": boundary_key,
+            "source": population_signature,
+            "column": cfg.population_column,
+            "crs": str(metric_crs),
+        })
+        population_data = cache.load_frame("population_evidence", population_key)
+        if population_data is None:
+            population_data = population_cells(
+                population,
+                population_column=cfg.population_column,
+                target_crs=metric_crs,
+                boundary=city_geom,
+            )
+            cache.save_frame("population_evidence", population_key, population_data)
+        else:
+            cache_hits.append("population_evidence")
         logging.info(
             "Prepared %d population cell(s) for adaptive splitting",
             len(population_data),
         )
+    stage_started = time.perf_counter()
     building_evidence = None
     if cfg.adaptive_sizing and cfg.building_raster_path is not None:
-        building_evidence = _load_building_evidence(city_geom, metric_crs, cfg)
+        building_key = stable_cache_key({
+            "boundary": boundary_key,
+            "source": building_signature,
+            "crs": str(metric_crs),
+            "config": _config_signature(cfg, fields={
+                "building_count_band",
+                "building_height_band",
+                "building_presence_band",
+                "building_presence_threshold",
+                "building_max_samples",
+            }),
+        })
+        building_evidence = cache.load_frame("building_evidence", building_key)
+        if building_evidence is None:
+            building_evidence = _load_building_evidence(city_geom, metric_crs, cfg)
+            cache.save_frame("building_evidence", building_key, building_evidence)
+        else:
+            cache_hits.append("building_evidence")
+            logging.info(
+                "Reusing %d prepared building evidence point(s)",
+                len(building_evidence),
+            )
+    timings["evidence_preparation_s"] = time.perf_counter() - stage_started
     evidence = _AdaptiveEvidence(
         population=population_data,
         buildings=building_evidence,
@@ -1948,91 +2713,151 @@ def create_automatic_taz(
             cfg.target_population,
             population_total,
         )
-    edges = _load_edges(graph, city, cfg)
-    if edges.crs is None:
-        raise TAZGeometryError("Road graph edges must have a CRS")
-    edges = edges.to_crs(metric_crs).copy()
-    highway = edges.get("highway", pd.Series(index=edges.index, dtype="object"))
-    edges["highway_type"] = highway.map(_normalize_highway)
+    stage_started = time.perf_counter()
+    road_key = stable_cache_key({
+        "boundary": boundary_key,
+        "source": graph_signature,
+        "network_type": cfg.network_type,
+        "crs": str(metric_crs),
+    })
+    edges = cache.load_frame("prepared_roads", road_key)
+    if edges is None:
+        edges = _load_edges(graph, city, cfg)
+        if edges.crs is None:
+            raise TAZGeometryError("Road graph edges must have a CRS")
+        edges = edges.to_crs(metric_crs).copy()
+        highway = edges.get("highway", pd.Series(index=edges.index, dtype="object"))
+        edges["highway_type"] = highway.map(_normalize_highway)
+        # A first OSM download changes the source path signature. Persist under
+        # the post-download key that subsequent runs will calculate.
+        graph_signature = _input_signature(
+            _road_edge_cache_path(cfg) if graph is None else graph
+        )
+        road_key = stable_cache_key({
+            "boundary": boundary_key,
+            "source": graph_signature,
+            "network_type": cfg.network_type,
+            "crs": str(metric_crs),
+        })
+        cache_edges = edges[["highway_type", "geometry"]].copy()
+        cache_edges["highway_type"] = cache_edges["highway_type"].map(
+            _cache_highway
+        )
+        cache.save_frame("prepared_roads", road_key, cache_edges)
+    else:
+        cache_hits.append("prepared_roads")
+        logging.info("Reusing %d prepared road edge(s)", len(edges))
+    edges["highway_type"] = edges["highway_type"].map(_normalize_highway)
+    timings["road_preparation_s"] = time.perf_counter() - stage_started
+    final_key = stable_cache_key({
+        "algorithm_version": _FINAL_RESULT_CACHE_VERSION,
+        "boundary": boundary_key,
+        "graph": graph_signature,
+        "population": population_signature,
+        "buildings": building_signature,
+        "config": final_config_signature,
+    })
     major = edges[edges.highway_type.isin(cfg.major_road_types)].copy()
     local = edges[edges.highway_type.isin(cfg.local_road_types)].copy()
-    _export_layer(city_m, cfg.output_dir / "00_boundary.geojson", cfg)
-    _export_layer(major, cfg.output_dir / "01_major_roads.geojson", cfg)
-    _export_layer(local, cfg.output_dir / "02_local_roads.geojson", cfg)
-    major_corridors, major_centerlines = _centerlines(major, cfg.major_road_buffer_m, cfg)
-    _export_layer(major_corridors, cfg.output_dir / "03_major_road_corridors.geojson", cfg)
-    _export_layer(major_centerlines, cfg.output_dir / "04_major_road_centerlines.geojson", cfg)
-    road_polygons, road_dangles = _polygonize(major_centerlines, city_geom, metric_crs)
-    road_barriers = road_polygons[road_polygons.area_km2 >= cfg.barrier_min_area_km2].copy()
-    road_barriers.geometry = road_barriers.boundary
-    _export_layer(road_polygons, cfg.output_dir / "05_major_road_polygons.geojson", cfg)
-    _export_layer(road_dangles, cfg.output_dir / "05a_major_road_dangles.geojson", cfg)
-    _export_layer(road_barriers, cfg.output_dir / "06_major_road_barriers.geojson", cfg)
-    natural = _gdf([], metric_crs)
-    if cfg.fetch_railways_and_waterways:
-        try:
-            import osmnx as ox
-            features = ox.features_from_polygon(city.to_crs(cfg.export_crs).geometry.iloc[0], tags={"railway": True, "waterway": True})
-            if features is not None and not features.empty:
-                features = gpd.clip(features.to_crs(metric_crs), city_m)
-                linear = features.geometry.geom_type.isin(["LineString", "MultiLineString"])
-                railway = features[linear & features.get("railway", pd.Series(index=features.index, dtype="object")).isin(cfg.railway_types)]
-                water = features[linear & features.get("waterway", pd.Series(index=features.index, dtype="object")).notna()]
-                natural = gpd.GeoDataFrame(pd.concat([railway[["geometry"]], water[["geometry"]]], ignore_index=True), geometry="geometry", crs=metric_crs)
-        except Exception as exc:
-            logging.warning("Natural-feature retrieval failed; continuing with roads: %s", exc)
-    natural_corridors, natural_centerlines = _centerlines(natural, cfg.barrier_buffer_m, cfg)
-    natural_polygons, natural_dangles = _polygonize(natural_centerlines, city_geom, metric_crs)
-    natural_barriers = natural_polygons[natural_polygons.area_km2 >= cfg.barrier_min_area_km2].copy()
-    natural_barriers.geometry = natural_barriers.boundary
-    for name, frame in [("07_raw_railway_waterway_lines", natural), ("08_railway_waterway_corridors", natural_corridors),
-                        ("09_railway_waterway_centerlines", natural_centerlines), ("09a_railway_waterway_dangles", natural_dangles),
-                        ("10_railway_waterway_barriers", natural_barriers)]:
-        _export_layer(frame, cfg.output_dir / f"{name}.geojson", cfg)
-    barrier_lines = gpd.GeoDataFrame(pd.concat([road_barriers[["geometry"]], natural_barriers[["geometry"]]], ignore_index=True), geometry="geometry", crs=metric_crs)
-    first_coarse, first_dangles = _polygonize(barrier_lines, city_geom, metric_crs)
-    first_coarse = _merge_small(first_coarse, cfg.coarse_min_area_km2)
-    first_coarse = _normalize_polygon_frame(
-        first_coarse, stage="initial coarse partition"
-    )
-    boundary_gdf = _gdf(list(first_coarse.boundary), metric_crs)
-    coarse_corridors, coarse_centerlines = _centerlines(boundary_gdf, cfg.coarse_boundary_buffer_m, cfg)
-    cleaned_centerlines = _prune_terminal_branches(coarse_centerlines, cfg.max_dangle_length_m, cfg.node_rounding_decimals)
-    cleanup_candidate, cleaned_dangles = _polygonize(cleaned_centerlines, city_geom, metric_crs)
-    if len(cleanup_candidate) > cfg.max_coarse_cleanup_polygons:
-        coarse, save_candidate = first_coarse.copy().reset_index(drop=True), False
+    stage_started = time.perf_counter()
+    coarse_key = stable_cache_key({
+        "algorithm_version": _PREPARED_STAGE_CACHE_VERSION,
+        "boundary": boundary_key,
+        "road_key": road_key,
+        "config": _config_signature(cfg, fields={
+            "major_road_types",
+            "local_road_types",
+            "railway_types",
+            "fetch_railways_and_waterways",
+            "major_road_buffer_m",
+            "barrier_buffer_m",
+            "coarse_boundary_buffer_m",
+            "centerline_interpolation_m",
+            "max_dangle_length_m",
+            "max_coarse_cleanup_polygons",
+            "node_rounding_decimals",
+            "barrier_min_area_km2",
+            "coarse_min_area_km2",
+            "max_coarse_area_km2",
+            "max_coarse_road_edges",
+            "max_coarse_vertices",
+            "max_coarse_split_depth",
+            "divider_extension_m",
+            "road_snap_max_distance_m",
+            "divider_sample_spacing_m",
+            "max_divider_samples",
+            "oriented_fallback_min_area_km2",
+        }),
+    })
+    coarse = cache.load_frame("coarse_partition", coarse_key)
+    if coarse is None:
+        coarse, workload_dividers = _build_coarse_partition(
+            city,
+            city_m,
+            city_geom,
+            major,
+            local,
+            metric_crs,
+            cfg,
+        )
+        cache.save_frame("coarse_partition", coarse_key, coarse)
     else:
-        coarse, save_candidate = _merge_small(cleanup_candidate, cfg.coarse_min_area_km2).reset_index(drop=True), True
-    coarse = _normalize_polygon_frame(coarse, stage="coarse partition")
-    _validate_partition(coarse, city_geom, stage="coarse partition")
-    coarse["coarse_zone_id"] = range(len(coarse))
-    for name, frame in [("11_initial_coarse_zones", first_coarse), ("11a_initial_coarse_dangles", first_dangles),
-                        ("12_coarse_boundary_corridors", coarse_corridors), ("13_coarse_boundary_centerlines_raw", coarse_centerlines),
-                        ("14_coarse_boundary_centerlines_dangle_pruned", cleaned_centerlines), ("14a_coarse_polygonize_dangles", cleaned_dangles)]:
-        _export_layer(frame, cfg.output_dir / f"{name}.geojson", cfg)
-    if save_candidate:
-        _export_layer(cleanup_candidate, cfg.output_dir / "14b_coarse_cleanup_candidate.geojson", cfg)
-    _export_layer(coarse, cfg.output_dir / "15_coarse_zones.geojson", cfg)
-    records, divider_records = [], []
-    for coarse_id, row in coarse.iterrows():
+        cache_hits.append("coarse_partition")
+        workload_dividers = _gdf([], metric_crs)
+        logging.info("Reusing %d workload-balanced coarse zone(s)", len(coarse))
+        _validate_partition(coarse, city_geom, stage="cached coarse partition")
+        _export_layer(coarse, cfg.output_dir / "15_coarse_zones.geojson", cfg)
+    timings["coarse_partition_s"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
+
+    def split_coarse(
+        item: tuple[int, Any]
+    ) -> tuple[int, list[Any], list[Any], dict[str, Any]]:
+        """Split one coarse row with isolated evidence caches."""
+        coarse_id, row = item
+        coarse_started = time.perf_counter()
         logging.info(
             "Splitting coarse zone %d/%d (%.3f km2)",
             coarse_id + 1, len(coarse), float(row.area_km2),
         )
+        parent_roads = _clip_roads_to_geometry(local, row.geometry)
+        task_evidence = _fresh_evidence(evidence) if cfg.n_jobs > 1 else evidence
         zone_records, dividers = _recursive_split(
             row.geometry,
-            local,
+            parent_roads,
             metric_crs,
             cfg,
             coarse_id,
-            evidence=evidence,
+            evidence=task_evidence,
+            roads_clipped=True,
         )
-        records.extend(zone_records)
-        divider_records.extend(dividers)
         logging.info(
             "Completed coarse zone %d/%d with %d final part(s)",
             coarse_id + 1, len(coarse), len(zone_records),
         )
+        return coarse_id, zone_records, dividers, {
+            "coarse_zone_id": int(coarse_id),
+            "area_km2": float(row.area_km2),
+            "road_edges": int(len(parent_roads)),
+            "output_parts": int(len(zone_records)),
+            "elapsed_s": time.perf_counter() - coarse_started,
+        }
+
+    items = list(coarse.iterrows())
+    if cfg.n_jobs == 1:
+        completed = [split_coarse(item) for item in items]
+    else:
+        logging.info("Splitting %d coarse zones with %d worker threads", len(items), cfg.n_jobs)
+        with ThreadPoolExecutor(max_workers=cfg.n_jobs) as executor:
+            completed = list(executor.map(split_coarse, items))
+    records, divider_records, coarse_timings = [], [], []
+    for _, zone_records, dividers, coarse_timing in completed:
+        records.extend(zone_records)
+        divider_records.extend(dividers)
+        coarse_timings.append(coarse_timing)
+    timings["recursive_splitting_s"] = time.perf_counter() - stage_started
+
+    stage_started = time.perf_counter()
     if cfg.retry_failed_splits_with_enclosed_zones:
         final, divider_records, hole_absorptions = _retry_failed(
             records,
@@ -2060,6 +2885,7 @@ def create_automatic_taz(
         cfg.coverage_simplify_tolerance_m,
         city_geom,
     )
+    timings["final_cleanup_s"] = time.perf_counter() - stage_started
     final_decisions = [
         _adaptive_split_decision(geometry, cfg, evidence)
         for geometry in final.geometry
@@ -2094,16 +2920,30 @@ def create_automatic_taz(
         )
     )
     failures = final[~(regular_target | oriented_target)].copy()
-    for name, frame in [("16_recursive_split_dividers", dividers), ("16a_tazs_absorbed_for_failed_hole_retries", hole_absorptions),
-                        ("16b_final_undersized_tazs_merged", undersized_merges),
-                        ("16c_final_corridor_geometries_transferred", narrow_corridors),
-                        ("16d_final_undersized_tazs_merged_after_corridor_cleanup", post_corridor_merges),
-                        ("17_final_tazs_with_status", final),
-                        ("17a_final_tazs_not_in_target_range", failures)]:
-        _export_layer(frame, cfg.output_dir / f"{name}.geojson", cfg)
+    for name, frame in [
+        ("16_recursive_split_dividers", dividers),
+        ("16a_tazs_absorbed_for_failed_hole_retries", hole_absorptions),
+        ("16b_final_undersized_tazs_merged", undersized_merges),
+        ("16c_final_corridor_geometries_transferred", narrow_corridors),
+        ("16d_final_undersized_tazs_merged_after_corridor_cleanup", post_corridor_merges),
+    ]:
+        _export_layer(frame, cfg.output_dir / f"{name}.geojson", cfg, level="full")
+    _export_layer(
+        final,
+        cfg.output_dir / "17_final_tazs_with_status.geojson",
+        cfg,
+        level="always",
+    )
+    _export_layer(
+        failures,
+        cfg.output_dir / "17a_final_tazs_not_in_target_range.geojson",
+        cfg,
+        level="summary",
+    )
     _plot_layers(plots / "04_final_tazs_by_status", cfg, [(final, {"column": "status", "categorical": True, "legend": True, "edgecolor": "black", "linewidth": .25}), (city_m, {"facecolor": "none", "edgecolor": "black"})], "Final TAZs and recursive-split status")
     _plot_layers(plots / "05_final_tazs_and_dividers", cfg, [(final.boundary, {"color": "steelblue", "linewidth": .35}), (dividers, {"color": "red", "linewidth": .25}), (city_m, {"facecolor": "none", "edgecolor": "black"})], "Final TAZs with accepted recursive dividers")
     _plot_layers(plots / "05a_final_corridor_transfers", cfg, [(final.boundary, {"color": "lightgray", "linewidth": .3}), (narrow_corridors, {"color": "red", "edgecolor": "black", "alpha": .7}), (city_m, {"facecolor": "none", "edgecolor": "black"})], "Final corridor geometries transferred")
+    timings["total_s"] = time.perf_counter() - started
     metadata = {
         "automatic_taz_config": cfg,
         "output_dir": str(cfg.output_dir),
@@ -2132,8 +2972,40 @@ def create_automatic_taz(
         "split_balance_weight": cfg.split_balance_weight,
         "road_alignment_bonus": cfg.road_alignment_bonus,
         "coverage_simplify_tolerance_m": cfg.coverage_simplify_tolerance_m,
+        "cache_mode": cfg.cache_mode,
+        "cache_key": final_key,
+        "cache_hits": cache_hits,
+        "timings_s": timings,
+        "coarse_timings": coarse_timings,
+        "coarse_zone_count": int(len(coarse)),
+        "coarse_workload_dividers": int(len(workload_dividers)),
+        "n_jobs": cfg.n_jobs,
+        "diagnostics": cfg.diagnostics,
         **cfg.metadata,
     }
+    cache_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key != "automatic_taz_config"
+    }
+    cache.save_frame("final", final_key, final)
+    cache.save_json("final", final_key, {"metadata": cache_metadata})
+    manifest = {
+        "algorithm_version": _FINAL_RESULT_CACHE_VERSION,
+        "prepared_stage_cache_version": _PREPARED_STAGE_CACHE_VERSION,
+        "cache_key": final_key,
+        "cache_hits": cache_hits,
+        "config": final_config_signature,
+        "timings_s": timings,
+        "coarse_timings": coarse_timings,
+        "input_zone_count": int(len(coarse)),
+        "output_zone_count": int(len(final)),
+        "failure_count": int(len(failures)),
+    }
+    (cfg.output_dir / "run_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
     return TAZFrame(final, metadata)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +117,16 @@ class TAZTests(unittest.TestCase):
                 split_compactness_weight=0,
                 split_balance_weight=0,
             )
+        with self.assertRaisesRegex(ValueError, "cache_mode"):
+            ogm.taz.AutomaticTAZConfig(cache_mode="invalid")
+        with self.assertRaisesRegex(ValueError, "diagnostics"):
+            ogm.taz.AutomaticTAZConfig(diagnostics="everything")
+        with self.assertRaisesRegex(ValueError, "n_jobs"):
+            ogm.taz.AutomaticTAZConfig(n_jobs=0)
+        with self.assertRaisesRegex(ValueError, "max_divider_samples"):
+            ogm.taz.AutomaticTAZConfig(max_divider_samples=1)
+        with self.assertRaisesRegex(TypeError, "metis_seed"):
+            ogm.taz.AutomaticTAZConfig(metis_seed=True)
 
     def test_google_building_downloader_selects_intersecting_tiles_and_caches(self) -> None:
         """Download only boundary-intersecting public tiles and reuse the cache."""
@@ -324,6 +335,125 @@ class TAZTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertAlmostEqual(merged.area_km2.iloc[0], 1.1)
         self.assertEqual(len(audit), 1)
+
+    def test_fast_road_clipping_preserves_contained_and_crossing_lines(self) -> None:
+        """Clip only boundary-crossing roads without changing the result."""
+        from opengeomove.taz import automatic
+
+        parent = box(0, 0, 100, 100)
+        roads = gpd.GeoDataFrame(
+            {"name": ["inside", "crossing", "outside"]},
+            geometry=[
+                LineString([(10, 10), (90, 90)]),
+                LineString([(-10, 50), (110, 50)]),
+                LineString([(200, 200), (300, 300)]),
+            ],
+            crs="EPSG:32643",
+        )
+
+        clipped = automatic._clip_roads_to_geometry(roads, parent)
+
+        self.assertEqual(clipped.name.tolist(), ["inside", "crossing"])
+        self.assertAlmostEqual(clipped.loc[0, "geometry"].length, 80 * 2 ** 0.5)
+        self.assertAlmostEqual(clipped.loc[1, "geometry"].length, 100.0)
+
+    def test_coarse_workload_balancing_preserves_coverage(self) -> None:
+        """Pre-split an oversized coarse zone into bounded independent work."""
+        from opengeomove.taz import automatic
+
+        boundary = box(0, 0, 4000, 1000)
+        coarse = gpd.GeoDataFrame(geometry=[boundary], crs="EPSG:32643")
+        roads = gpd.GeoDataFrame(geometry=[], crs=coarse.crs)
+        config = ogm.taz.AutomaticTAZConfig(
+            max_coarse_area_km2=1.1,
+            max_coarse_road_edges=None,
+            max_coarse_vertices=None,
+            max_coarse_split_depth=4,
+            oriented_fallback_min_area_km2=0.01,
+            final_min_area_km2=0.01,
+        )
+
+        balanced, dividers = automatic._balance_coarse_workloads(
+            coarse, roads, coarse.crs, config
+        )
+
+        self.assertGreaterEqual(len(balanced), 4)
+        self.assertGreater(len(dividers), 0)
+        self.assertLessEqual(balanced.area_km2.max(), 1.1 + 1e-6)
+        automatic._validate_partition(
+            balanced, boundary, stage="balanced coarse test"
+        )
+
+    def test_automatic_taz_reuses_exact_result_cache(self) -> None:
+        """Return an identical cached result without rebuilding road stages."""
+        from opengeomove.taz import automatic
+
+        boundary = gpd.GeoDataFrame(
+            geometry=[box(77.0, 28.0, 77.001, 28.001)], crs="EPSG:4326"
+        )
+        roads = gpd.GeoDataFrame(
+            {"highway": ["primary"]},
+            geometry=[LineString([(76.999, 28.0005), (77.002, 28.0005)])],
+            crs="EPSG:4326",
+        )
+
+        def no_centerlines(lines, buffer_m, config):
+            """Skip medial-axis work in the small cache orchestration test."""
+            empty = gpd.GeoDataFrame(geometry=[], crs=lines.crs)
+            return empty, empty.copy()
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = ogm.taz.AutomaticTAZConfig(
+                output_dir=Path(directory),
+                cache_dir=Path(directory) / "cache",
+                diagnostics="none",
+                fetch_railways_and_waterways=False,
+                save_plots=False,
+                barrier_min_area_km2=0.001,
+                coarse_min_area_km2=0.001,
+                final_min_area_km2=0.001,
+                final_max_area_km2=1.5,
+            )
+            with patch.object(automatic, "_centerlines", side_effect=no_centerlines):
+                first = ogm.taz.create_automatic_taz(boundary, roads, config=config)
+            with patch.object(
+                automatic,
+                "_load_edges",
+                side_effect=AssertionError("exact cache should skip road loading"),
+            ):
+                second = ogm.taz.create_automatic_taz(boundary, roads, config=config)
+
+            self.assertEqual(first.data.taz_id.tolist(), second.data.taz_id.tolist())
+            self.assertEqual(second.metadata["cache_hit"], "final")
+            self.assertTrue((Path(directory) / "17_final_tazs_with_status.geojson").is_file())
+            self.assertFalse((Path(directory) / "00_boundary.geojson").exists())
+            manifest = json.loads(
+                (Path(directory) / "run_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["cache_hit"], "final")
+            self.assertIn("timings_s", manifest)
+            self.assertIn("prepared_stage_cache_version", manifest)
+
+            with (
+                patch.object(
+                    automatic,
+                    "_load_edges",
+                    side_effect=AssertionError("prepared road cache was not reused"),
+                ),
+                patch.object(
+                    automatic,
+                    "_build_coarse_partition",
+                    side_effect=AssertionError("prepared coarse cache was not reused"),
+                ),
+            ):
+                retuned = ogm.taz.create_automatic_taz(
+                    boundary,
+                    roads,
+                    config=config,
+                    final_max_area_km2=1.4,
+                )
+            self.assertIn("prepared_roads", retuned.metadata["cache_hits"])
+            self.assertIn("coarse_partition", retuned.metadata["cache_hits"])
 
     def test_final_undersized_merge_skips_null_geometry_rows(self) -> None:
         """Ignore empty artifacts while merging valid final zones."""
