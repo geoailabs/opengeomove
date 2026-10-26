@@ -66,10 +66,10 @@ def open(path: PathLike, *, eager_metadata: bool = False) -> Dataset:
             relation = connection.read_parquet(str(resolved_path))
             data_format = "parquet"
         elif suffix == ".csv":
-            relation = connection.read_csv(str(resolved_path), delim=",")
+            relation = connection.read_csv(str(resolved_path), delimiter=",")
             data_format = "csv"
         elif suffix == ".tsv":
-            relation = connection.read_csv(str(resolved_path), delim="\t")
+            relation = connection.read_csv(str(resolved_path), delimiter="\t")
             data_format = "tsv"
         else:
             relation = connection.read_json(str(resolved_path))
