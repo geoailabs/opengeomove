@@ -517,6 +517,33 @@ class TAZTests(unittest.TestCase):
                 incomplete, boundary, stage="incomplete test"
             )
 
+    def test_automatic_export_repairs_invalid_polygon_rows(self) -> None:
+        """Repair polygon artifacts before writing a reprojected diagnostic."""
+        from opengeomove.taz import automatic
+
+        bow_tie = Polygon([(0, 0), (1000, 1000), (0, 1000), (1000, 0), (0, 0)])
+        layer = gpd.GeoDataFrame(
+            {"name": ["invalid-after-projection"]},
+            geometry=[bow_tie],
+            crs="EPSG:32643",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "export.geojson"
+            automatic._export_layer(
+                layer,
+                destination,
+                ogm.taz.AutomaticTAZConfig(
+                    output_dir=Path(directory), diagnostics="full"
+                ),
+            )
+            exported = gpd.read_file(destination)
+
+        self.assertEqual(len(exported), 1)
+        self.assertTrue(exported.geometry.is_valid.all())
+        self.assertTrue(
+            exported.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).all()
+        )
+
     def test_adaptive_split_uses_building_density_and_population(self) -> None:
         """Scale area targets by buildings and allow population to force a split."""
         from opengeomove.taz import automatic

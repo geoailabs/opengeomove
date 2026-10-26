@@ -562,6 +562,29 @@ def _export_layer(
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     output = layer.to_crs(cfg.export_crs)
+    polygon_rows = output.geometry.geom_type.isin(
+        ["Polygon", "MultiPolygon", "GeometryCollection"]
+    )
+    invalid_polygons = polygon_rows & ~output.geometry.is_valid
+    if invalid_polygons.any():
+        logging.warning(
+            "Repairing %d polygon row(s) made invalid while reprojecting %s",
+            int(invalid_polygons.sum()),
+            path.name,
+        )
+        output.loc[invalid_polygons, output.geometry.name] = output.loc[
+            invalid_polygons, output.geometry.name
+        ].map(_valid_polygonal)
+        unusable = (
+            output.geometry.isna()
+            | output.geometry.is_empty
+            | (polygon_rows & ~output.geometry.is_valid)
+        )
+        if unusable.any():
+            raise TAZGeometryError(
+                f"Export reprojection produced {int(unusable.sum())} unusable "
+                f"geometry row(s) for {path}"
+            )
     output.to_file(path, driver="GeoJSON")
     logging.info("Saved %d features: %s", len(layer), path)
     return path
