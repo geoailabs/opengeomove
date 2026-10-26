@@ -12,11 +12,21 @@ from opengeomove.taz.exceptions import TAZDependencyError, TAZError, TAZGeometry
 from opengeomove.taz.models import StudyArea, TAZFrame, TAZReport
 from opengeomove.taz.plotting import plot_taz
 from opengeomove.taz.population import PopulationSource, attach_population, population_cells
+from opengeomove.taz.socioeconomic import (
+    SOCIOECONOMIC_CLASSES,
+    SOCIOECONOMIC_FEATURE_COLUMNS,
+    SocioeconomicClassifier,
+    extract_socioeconomic_features,
+    fit_socioeconomic_classifier,
+)
 from opengeomove.data_loading.google_buildings import download_open_buildings_25d
 
 __all__ = [
     "AutomaticTAZConfig",
     "PopulationSource",
+    "SOCIOECONOMIC_CLASSES",
+    "SOCIOECONOMIC_FEATURE_COLUMNS",
+    "SocioeconomicClassifier",
     "StudyArea",
     "TAZBuilder",
     "TAZComparison",
@@ -32,6 +42,8 @@ __all__ = [
     "create_automatic_taz",
     "create_taz",
     "download_open_buildings_25d",
+    "extract_socioeconomic_features",
+    "fit_socioeconomic_classifier",
     "population_cells",
     "plot_taz",
 ]
