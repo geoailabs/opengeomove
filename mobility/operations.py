@@ -8,6 +8,7 @@ import math
 from typing import TYPE_CHECKING, Any
 
 import duckdb
+import pandas as pd
 
 from opengeomove.data_cleaning.filters import _utc_timestamp_expression, _validate_timezone
 from opengeomove.mobility.config import MobilityThresholds
@@ -110,10 +111,10 @@ def _write_rows(
     """Append a bounded buffer of output rows to a temporary table."""
     if not rows:
         return
-    placeholders = ", ".join("?" for _ in range(column_count))
-    connection.executemany(
-        f"INSERT INTO {_quote_identifier(table_name)} VALUES ({placeholders})", rows
-    )
+    # One bounded vectorized append avoids executing a separate SQL statement
+    # for every result row. The caller still limits the buffer to 2,048 rows.
+    batch = pd.DataFrame.from_records(rows, columns=[f"column_{i}" for i in range(column_count)])
+    connection.append(table_name, batch, by_name=False)
     rows.clear()
 
 
