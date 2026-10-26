@@ -117,13 +117,17 @@ def _write_rows(
     rows.clear()
 
 
-def _result_dataset(source: Dataset, table_name: str) -> Dataset:
-    """Wrap a temporary result table in a Dataset sharing the source connection."""
+def _result_dataset(
+    source: Dataset,
+    table_name: str,
+    connection: duckdb.DuckDBPyConnection | None = None,
+) -> Dataset:
+    """Wrap a result table using its owning connection and source provenance."""
     from opengeomove.data_loading.dataset import Dataset
 
     result = Dataset(
-        relation=source._connection.table(table_name),
-        connection=source._connection,
+        relation=(connection if connection is not None else source._connection).table(table_name),
+        connection=connection if connection is not None else source._connection,
         source_path=source.source,
         data_format=source.format,
     )
@@ -174,7 +178,8 @@ def cluster_stops(
         A Dataset with one row per detected stop and columns ``cluster_id``,
         ``device_id``, ``start_time``, ``end_time``, ``latitude``,
         ``longitude``, ``ping_count``, and ``duration_s``. Results are stored
-        in a temporary DuckDB table tied to the source Dataset's connection.
+        in a temporary DuckDB table on an independent cursor in the same
+        database. The result retains that cursor for its lifetime.
 
     Raises:
         TypeError: If a Dataset, column name, or threshold has an invalid type.
@@ -253,7 +258,11 @@ def cluster_stops(
         "end_time TIMESTAMPTZ, latitude DOUBLE, longitude DOUBLE, "
         "ping_count BIGINT, duration_s DOUBLE"
     )
-    _create_result_table(dataset._connection, table_name, schema)
+    # DuckDB queries and executemany on one connection invalidate an active
+    # fetchmany reader. Keep result writes on a separate cursor so flushing
+    # bounded output buffers cannot silently truncate the input stream.
+    writer = dataset._connection.cursor()
+    _create_result_table(writer, table_name, schema)
     output_rows: list[tuple[Any, ...]] = []
     cluster_id = 0
     candidate: dict[str, Any] | None = None
@@ -285,7 +294,7 @@ def cluster_stops(
                 )
             )
             if len(output_rows) >= _WRITE_BATCH_SIZE:
-                _write_rows(dataset._connection, table_name, output_rows, 8)
+                _write_rows(writer, table_name, output_rows, 8)
         candidate = None
 
     def start_candidate(device_value: Any, observed_at: datetime, lat: float, lon: float) -> dict[str, Any]:
@@ -342,11 +351,12 @@ def cluster_stops(
                     candidate["z_sum"] += math.sin(latitude_radians)
                     candidate["ping_count"] += 1
         finish_candidate()
-        _write_rows(dataset._connection, table_name, output_rows, 8)
+        _write_rows(writer, table_name, output_rows, 8)
     except Exception:
-        dataset._connection.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
+        writer.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
+        writer.close()
         raise
-    result = _result_dataset(dataset, table_name)
+    result = _result_dataset(dataset, table_name, writer)
     result._stop_merge_distance_m = max_distance_m
     return result
 
@@ -376,7 +386,8 @@ def form_trips(
         ``device_id``, ``origin_cluster_id``, ``destination_cluster_id``,
         ``start_time``, ``end_time``, origin and destination coordinates,
         ``duration_s``, and great-circle ``distance_m``. Results are stored in
-        a temporary DuckDB table tied to the source connection.
+        a temporary DuckDB table on an independent cursor in the same
+        database. The result retains that cursor for its lifetime.
 
     Raises:
         TypeError: If ``stops`` is not a Dataset or the threshold is invalid.
@@ -425,7 +436,8 @@ def form_trips(
         "destination_latitude DOUBLE, destination_longitude DOUBLE, "
         "duration_s DOUBLE, distance_m DOUBLE"
     )
-    _create_result_table(stops._connection, table_name, schema)
+    writer = stops._connection.cursor()
+    _create_result_table(writer, table_name, schema)
     output_rows: list[tuple[Any, ...]] = []
     trip_id = 0
     previous: tuple[Any, ...] | None = None
@@ -467,10 +479,11 @@ def form_trips(
                             )
                         )
                         if len(output_rows) >= _WRITE_BATCH_SIZE:
-                            _write_rows(stops._connection, table_name, output_rows, 12)
+                            _write_rows(writer, table_name, output_rows, 12)
                 previous = current
-        _write_rows(stops._connection, table_name, output_rows, 12)
+        _write_rows(writer, table_name, output_rows, 12)
     except Exception:
-        stops._connection.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
+        writer.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
+        writer.close()
         raise
-    return _result_dataset(stops, table_name)
+    return _result_dataset(stops, table_name, writer)

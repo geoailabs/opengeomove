@@ -207,6 +207,77 @@ class MobilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._stops(device_id_col="unknown")
 
+    def test_stop_and_trip_streams_survive_multiple_output_flushes(self) -> None:
+        """Consume every input batch while flushing stop and trip result buffers."""
+        path = Path(self._temporary_directory.name) / "many-stops.parquet"
+        connection = duckdb.connect()
+        connection.execute(
+            """COPY (
+                SELECT 'a' AS device_id,
+                    TIMESTAMP '2025-01-01' +
+                        (i // 2 * 600 + i % 2 * 300) * INTERVAL 1 SECOND AS observed_at,
+                    (28.6 + (i // 2 % 2) * 0.02)::DOUBLE AS lat,
+                    77.2::DOUBLE AS lon
+                FROM range(20000) t(i)
+            ) TO ? (FORMAT PARQUET)""",
+            [str(path)],
+        )
+        connection.close()
+        source = ogm.open(path)
+        stops = source.cluster_stops(
+            device_id_col="device_id", timestamp_col="observed_at",
+            lat_col="lat", lon_col="lon", max_distance_m=100,
+            min_stop_duration_s=300, max_time_gap_s=900,
+        )
+        trips = stops.form_trips(max_time_gap_s=900)
+        try:
+            self.assertEqual(stops.shape[0], 10000)
+            self.assertEqual(trips.shape[0], 9999)
+            self.assertEqual(sum(row[6] for row in stops.rows), 20000)
+            last = trips._relation.aggregate("max(destination_cluster_id)").fetchone()[0]
+            self.assertEqual(last, 10000)
+            self.assertEqual(source.shape[0], 20000)
+        finally:
+            trips._connection.close()
+            stops._connection.close()
+            source._connection.close()
+
+    def test_home_work_stream_survives_multiple_output_flushes(self) -> None:
+        """Classify devices after the first input batch and result-buffer flush."""
+        path = Path(self._temporary_directory.name) / "many-home-devices.parquet"
+        connection = duckdb.connect()
+        connection.execute(
+            """COPY (
+                SELECT i + 1 AS cluster_id,
+                    printf('device-%06d', i // 2) AS device_id,
+                    TIMESTAMPTZ '2025-01-06 15:30:00+00' +
+                        (i % 2) * INTERVAL 1 DAY AS start_time,
+                    TIMESTAMPTZ '2025-01-06 16:00:00+00' +
+                        (i % 2) * INTERVAL 1 DAY AS end_time,
+                    28.6::DOUBLE AS latitude, 77.2::DOUBLE AS longitude
+                FROM range(10000) t(i)
+            ) TO ? (FORMAT PARQUET)""",
+            [str(path)],
+        )
+        connection.close()
+        stops = ogm.open(path)
+        result = stops.classify_home_work(
+            timezone_name="Asia/Kolkata", min_visits=2,
+            min_distinct_days=2, min_total_dwell_s=3600,
+            merge_distance_m=100,
+        )
+        try:
+            self.assertEqual(result.shape[0], 10000)
+            classified_homes = result._relation.filter(
+                "role='home' AND classification_status='classified'"
+            ).count("*").fetchone()[0]
+            self.assertEqual(classified_homes, 5000)
+            self.assertEqual(result.nunique("device_id", approximate=False), 5000)
+            self.assertEqual(stops.shape[0], 10000)
+        finally:
+            result._connection.close()
+            stops._connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()

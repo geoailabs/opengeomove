@@ -101,6 +101,9 @@ def classify_home_work(
     another candidate. Otherwise it is returned with ``uncertain`` status.
     The operation streams stop rows in bounded batches, retaining aggregated
     location candidates rather than source pings in Python memory.
+    Results are written through an independent DuckDB cursor in the same
+    database, so bounded output flushes do not invalidate the input reader.
+    The returned Dataset owns the result cursor for its lifetime.
 
     Args:
         stops: Stop-summary Dataset, normally returned by ``cluster_stops``.
@@ -194,7 +197,8 @@ def classify_home_work(
         "classification_status VARCHAR, candidate_count BIGINT, visit_count BIGINT, "
         "distinct_days BIGINT, total_dwell_s DOUBLE"
     )
-    stops._connection.execute(
+    writer = stops._connection.cursor()
+    writer.execute(
         f"CREATE TEMP TABLE {_quote_identifier(table_name)} ({schema})"
     )
     zone = ZoneInfo(timezone_name)
@@ -270,7 +274,7 @@ def classify_home_work(
                 )
             )
         if len(output_rows) >= _WRITE_BATCH_SIZE:
-            _write_rows(stops._connection, table_name, output_rows, len(columns))
+            _write_rows(writer, table_name, output_rows, len(columns))
 
     try:
         current_device: Any = None
@@ -336,8 +340,9 @@ def classify_home_work(
                         metric["dwell"] += dwell
         if have_device:
             flush_device(current_device)
-        _write_rows(stops._connection, table_name, output_rows, len(columns))
+        _write_rows(writer, table_name, output_rows, len(columns))
     except Exception:
-        stops._connection.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
+        writer.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
+        writer.close()
         raise
-    return _result_dataset(stops, table_name)
+    return _result_dataset(stops, table_name, writer)
