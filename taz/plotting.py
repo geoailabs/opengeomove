@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from shapely import make_valid
 from shapely.geometry import mapping
 
 from opengeomove.taz.exceptions import TAZDependencyError, TAZGeometryError
@@ -61,6 +62,52 @@ def _plot_frame(zones: TAZFrame | gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     if not set(geometry.geom_type).issubset({"Polygon", "MultiPolygon"}):
         raise TAZGeometryError("zones must contain polygon geometry only")
     return frame
+
+
+def _wgs84_plot_frame(
+    zones: TAZFrame | gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Return a valid WGS84 display copy of polygon zones.
+
+    Reprojection can introduce microscopic ring self-intersections in otherwise
+    valid projected polygons. These are repaired only on the display copy; the
+    caller's geometries and analytical results remain unchanged.
+
+    Args:
+        zones: Validated TAZFrame or polygon GeoDataFrame.
+
+    Returns:
+        A reset-index GeoDataFrame in WGS84 with valid polygonal geometry.
+
+    Raises:
+        TAZGeometryError: If reprojection repair cannot retain polygonal zones.
+    """
+    frame = _plot_frame(zones)
+    wgs84 = frame.to_crs("EPSG:4326").reset_index(drop=True)
+    invalid = ~wgs84.geometry.is_valid
+    if invalid.any():
+        repaired = make_valid(
+            wgs84.loc[invalid].geometry.array,
+            method="structure",
+            keep_collapsed=False,
+        )
+        wgs84.loc[invalid, wgs84.geometry.name] = gpd.GeoSeries(
+            repaired,
+            index=wgs84.index[invalid],
+            crs="EPSG:4326",
+        )
+    geometry = wgs84.geometry
+    unusable = (
+        geometry.isna()
+        | geometry.is_empty
+        | ~geometry.is_valid
+        | ~geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    )
+    if unusable.any():
+        raise TAZGeometryError(
+            "zones could not be converted to valid polygon geometry for display"
+        )
+    return wgs84
 
 
 def _hover_value(value: Any) -> str:
@@ -198,7 +245,7 @@ def plot_taz(
     missing = set(columns) - set(frame.columns)
     if missing:
         raise ValueError(f"Hover columns do not exist: {sorted(missing)}")
-    wgs84 = frame.to_crs("EPSG:4326").reset_index(drop=True)
+    wgs84 = _wgs84_plot_frame(frame)
     feature_ids = [str(index) for index in wgs84.index]
     features = [
         {

@@ -15,7 +15,7 @@ import pandas as pd
 
 from opengeomove.taz.exceptions import TAZGeometryError
 from opengeomove.taz.models import TAZFrame
-from opengeomove.taz.plotting import plot_taz
+from opengeomove.taz.plotting import _wgs84_plot_frame, plot_taz
 
 
 @dataclass
@@ -117,8 +117,8 @@ class TAZComparison:
             json.dumps({"report": destination.name, "crs": str(self.matches.crs)}, indent=2),
             encoding="utf-8",
         )
-        actual_wgs84 = self.matches.to_crs("EPSG:4326").reset_index(drop=True)
-        generated_wgs84 = self.generated.to_crs("EPSG:4326").reset_index(drop=True)
+        actual_wgs84 = _wgs84_plot_frame(self.matches)
+        generated_wgs84 = _wgs84_plot_frame(self.generated)
 
         def to_feature_collection(frame: gpd.GeoDataFrame, id_column: str) -> dict[str, Any]:
             """Convert polygon rows to an ID-keyed GeoJSON feature collection."""
@@ -141,7 +141,7 @@ class TAZComparison:
         )
         actual_geojson = to_feature_collection(actual_wgs84, actual_id_column)
         figure = plot_taz(
-            generated_wgs84,
+            self.generated,
             opacity=0.82,
             boundary_color="#FFFFFF",
             boundary_width=0.8,
