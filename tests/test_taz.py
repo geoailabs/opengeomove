@@ -93,9 +93,14 @@ class TAZTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             report = comparison.write_report(Path(directory) / "comparison.html")
+            overlay_path = Path(directory) / "comparison_overlay.html"
             self.assertTrue(report.is_file())
-            self.assertTrue((Path(directory) / "comparison_overlay.html").is_file())
+            self.assertTrue(overlay_path.is_file())
             self.assertTrue((Path(directory) / "taz_matches.geojson").is_file())
+            overlay = overlay_path.read_text(encoding="utf-8")
+            self.assertIn("#FF00A8", overlay)
+            self.assertIn("#2E86DE", overlay)
+            self.assertIn("open-street-map", overlay)
 
     def test_invalid_area_settings_are_rejected(self) -> None:
         """Reject contradictory minimum and maximum area constraints."""
@@ -632,8 +637,8 @@ class TAZTests(unittest.TestCase):
             simplified, boundary, stage="simplified test partition"
         )
 
-    def test_plot_taz_builds_opaque_interactive_basemap_without_mutation(self) -> None:
-        """Render clear TAZ fills and hover fields over the configured map."""
+    def test_plot_taz_builds_colorful_interactive_overlay_without_mutation(self) -> None:
+        """Render categorical TAZ fills and hover fields over the base map."""
         zones = gpd.GeoDataFrame(
             {
                 "taz_id": ["left", "right"],
@@ -647,7 +652,7 @@ class TAZTests(unittest.TestCase):
         figure = ogm.taz.plot_taz(
             zones,
             opacity=0.8,
-            fill_color="#123456",
+            color_palette=("#123456", "#ABCDEF"),
             boundary_color="#FFFFFF",
             boundary_width=1.0,
             basemap_style="open-street-map",
@@ -659,6 +664,9 @@ class TAZTests(unittest.TestCase):
         self.assertEqual(figure.data[0].marker.line.color, "#FFFFFF")
         self.assertEqual(figure.data[0].marker.line.width, 1.0)
         self.assertEqual(list(figure.data[0].locations), ["0", "1"])
+        self.assertEqual(list(figure.data[0].z), [0, 1])
+        colors = {stop[1] for stop in figure.data[0].colorscale}
+        self.assertEqual(colors, {"#123456", "#ABCDEF"})
         self.assertIn("taz_id", figure.data[0].hovertemplate)
         self.assertTrue(zones.geometry.equals(original.geometry))
         self.assertEqual(zones.crs, original.crs)
@@ -677,6 +685,10 @@ class TAZTests(unittest.TestCase):
             ogm.taz.plot_taz(zones, hover_columns=("missing",))
         with self.assertRaisesRegex(TypeError, "iterable"):
             ogm.taz.plot_taz(zones, hover_columns="taz_id")
+        with self.assertRaisesRegex(TypeError, "color_palette"):
+            ogm.taz.plot_taz(zones, color_palette="#123456")
+        with self.assertRaisesRegex(ValueError, "color_palette"):
+            ogm.taz.plot_taz(zones, color_palette=())
 
     def test_automatic_taz_pipeline_handles_no_recursive_dividers(self) -> None:
         """Create/export a coarse partition when zones already meet size goals."""

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from io import BytesIO
 import html
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +15,7 @@ import pandas as pd
 
 from opengeomove.taz.exceptions import TAZGeometryError
 from opengeomove.taz.models import TAZFrame
+from opengeomove.taz.plotting import plot_taz
 
 
 @dataclass
@@ -52,8 +52,8 @@ class TAZComparison:
             The report file path. Beside it, the method writes reference and
             generated GeoJSON, per-reference-zone comparison GeoJSON, global
             metrics JSON, an interactive overlay map, and a manifest. The
-            overlay map uses Esri imagery tiles and needs internet access when
-            viewed; the report also embeds static map images.
+            overlay map uses OpenStreetMap tiles and needs internet access
+            when viewed; the report also embeds static map images.
         """
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -136,55 +136,50 @@ class TAZComparison:
             return {"type": "FeatureCollection", "features": features}
 
         actual_id_column = "actual_taz_id"
-        generated_id_column = "taz_id" if "taz_id" in generated_wgs84 else generated_wgs84.columns[0]
+        generated_id_column = (
+            "taz_id" if "taz_id" in generated_wgs84 else generated_wgs84.columns[0]
+        )
         actual_geojson = to_feature_collection(actual_wgs84, actual_id_column)
-        generated_geojson = to_feature_collection(generated_wgs84, generated_id_column)
-        figure = go.Figure()
+        figure = plot_taz(
+            generated_wgs84,
+            opacity=0.82,
+            boundary_color="#FFFFFF",
+            boundary_width=0.8,
+            basemap_style="open-street-map",
+            hover_columns=(generated_id_column,),
+        )
+        figure.data[0].name = f"Generated zones ({len(generated_wgs84):,})"
+        figure.data[0].showlegend = True
         figure.add_trace(go.Choroplethmapbox(
-            name=f"Reference zones ({len(actual_wgs84):,})",
+            name=f"Reference boundaries ({len(actual_wgs84):,})",
             geojson=actual_geojson,
             locations=actual_wgs84[actual_id_column].astype(str),
             z=[1] * len(actual_wgs84),
             featureidkey="id",
-            colorscale=[[0, "#19d3f3"], [1, "#19d3f3"]],
+            colorscale=[
+                [0, "rgba(255,0,168,0.08)"],
+                [1, "rgba(255,0,168,0.08)"],
+            ],
             showscale=False,
-            marker={"opacity": 0.14, "line": {"color": "#19d3f3", "width": 0.6}},
+            marker={
+                "opacity": 1.0,
+                "line": {"color": "#FF00A8", "width": 1.5},
+            },
             customdata=actual_wgs84[actual_id_column].astype(str),
             hovertemplate="Reference TAZ: %{customdata}<extra></extra>",
         ))
-        figure.add_trace(go.Choroplethmapbox(
-            name=f"Generated zones ({len(generated_wgs84):,})",
-            geojson=generated_geojson,
-            locations=generated_wgs84[generated_id_column].astype(str),
-            z=[1] * len(generated_wgs84),
-            featureidkey="id",
-            colorscale=[[0, "#ff5a36"], [1, "#ff5a36"]],
-            showscale=False,
-            marker={"opacity": 0.14, "line": {"color": "#ff5a36", "width": 0.6}},
-            customdata=generated_wgs84[generated_id_column].astype(str),
-            hovertemplate="Generated TAZ: %{customdata}<extra></extra>",
-        ))
-        minx, miny, maxx, maxy = actual_wgs84.total_bounds
-        span = max(maxx - minx, maxy - miny, 0.001)
         figure.update_layout(
-            title="Reference and generated TAZ overlay",
-            mapbox={
-                "style": "white-bg",
-                "center": {"lon": (minx + maxx) / 2, "lat": (miny + maxy) / 2},
-                "zoom": max(3, min(18, 12 - math.log(span, 2))),
-                "layers": [{
-                    "sourcetype": "raster",
-                    "source": [
-                        "https://server.arcgisonline.com/ArcGIS/rest/services/"
-                        "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-                    ],
-                    "below": "traces",
-                }],
-            },
+            title="Interactive generated and reference TAZ overlay",
             mapbox_uirevision="opengeomove-taz-comparison",
-            legend={"orientation": "h", "y": 1.02, "x": 0},
+            legend={
+                "orientation": "h",
+                "y": 1.02,
+                "x": 0,
+                "bgcolor": "rgba(255,255,255,0.88)",
+            },
             margin={"l": 0, "r": 0, "t": 50, "b": 0},
             height=760,
+            showlegend=True,
         )
         overlay_path = destination.with_name("comparison_overlay.html")
         figure.write_html(

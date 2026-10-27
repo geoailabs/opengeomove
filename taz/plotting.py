@@ -15,6 +15,22 @@ from opengeomove.taz.exceptions import TAZDependencyError, TAZGeometryError
 from opengeomove.taz.models import TAZFrame
 
 
+DEFAULT_TAZ_PALETTE = (
+    "#2E86DE",
+    "#E74C3C",
+    "#16A085",
+    "#F39C12",
+    "#8E44AD",
+    "#D35400",
+    "#00A8A8",
+    "#C0392B",
+    "#6C5CE7",
+    "#27AE60",
+    "#E84393",
+    "#0984E3",
+)
+
+
 def _plot_frame(zones: TAZFrame | gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Copy and validate polygon zones for display.
 
@@ -78,13 +94,34 @@ def _auto_map_view(frame: gpd.GeoDataFrame) -> tuple[dict[str, float], float]:
     return center, zoom
 
 
+def _categorical_colorscale(colors: tuple[str, ...]) -> list[list[Any]]:
+    """Build a stepped Plotly colorscale without interpolating zone colors.
+
+    Args:
+        colors: One or more Plotly-compatible color strings.
+
+    Returns:
+        Plotly colorscale stops that assign each integer category one color.
+    """
+    if len(colors) == 1:
+        return [[0.0, colors[0]], [1.0, colors[0]]]
+    maximum = len(colors) - 1
+    scale: list[list[Any]] = []
+    for index, color in enumerate(colors):
+        lower = 0.0 if index == 0 else (index - 0.5) / maximum
+        upper = 1.0 if index == maximum else (index + 0.5) / maximum
+        scale.extend([[lower, color], [upper, color]])
+    return scale
+
+
 def plot_taz(
     zones: TAZFrame | gpd.GeoDataFrame,
     *,
-    opacity: float = 0.75,
-    fill_color: str = "#2878B5",
+    opacity: float = 0.82,
+    fill_color: str | None = None,
+    color_palette: Iterable[str] = DEFAULT_TAZ_PALETTE,
     boundary_color: str = "#FFFFFF",
-    boundary_width: float = 0.7,
+    boundary_width: float = 0.8,
     basemap_style: str = "open-street-map",
     hover_columns: Iterable[str] = ("taz_id", "area_km2"),
 ) -> Any:
@@ -99,7 +136,10 @@ def plot_taz(
     Args:
         zones: TAZFrame or polygon GeoDataFrame with an explicit CRS.
         opacity: Polygon fill opacity from 0 (transparent) to 1 (opaque).
-        fill_color: Plotly-compatible polygon fill color.
+        fill_color: Optional single fill color. When ``None``, the categorical
+            ``color_palette`` is repeated across zones.
+        color_palette: Non-empty iterable of Plotly-compatible colors used to
+            distinguish zones when ``fill_color`` is ``None``.
         boundary_color: Plotly-compatible zone boundary color.
         boundary_width: Non-negative boundary width in display pixels.
         basemap_style: Plotly Mapbox style, default ``"open-street-map"``.
@@ -123,13 +163,26 @@ def plot_taz(
         raise TypeError("boundary_width must be a non-negative number")
     if not math.isfinite(boundary_width) or boundary_width < 0:
         raise ValueError("boundary_width must be finite and non-negative")
+    if fill_color is not None and (
+        not isinstance(fill_color, str) or not fill_color.strip()
+    ):
+        raise TypeError("fill_color must be None or a non-empty string")
     for name, value in (
-        ("fill_color", fill_color),
         ("boundary_color", boundary_color),
         ("basemap_style", basemap_style),
     ):
         if not isinstance(value, str) or not value.strip():
             raise TypeError(f"{name} must be a non-empty string")
+    if isinstance(color_palette, str):
+        raise TypeError("color_palette must be an iterable of color strings")
+    try:
+        palette = tuple(color_palette)
+    except TypeError as exc:
+        raise TypeError("color_palette must be an iterable of color strings") from exc
+    if not palette or any(
+        not isinstance(color, str) or not color.strip() for color in palette
+    ):
+        raise ValueError("color_palette must contain non-empty color strings")
     if isinstance(hover_columns, str):
         raise TypeError("hover_columns must be an iterable of column names, not a string")
     try:
@@ -166,6 +219,9 @@ def plot_taz(
         for index, column in enumerate(columns)
     ) + "<extra></extra>"
     center, zoom = _auto_map_view(wgs84)
+    colors = (fill_color,) if fill_color is not None else palette
+    colors = colors[: min(len(colors), len(wgs84))]
+    color_values = np.arange(len(wgs84), dtype=int) % len(colors)
 
     try:
         import plotly.graph_objects as go
@@ -175,8 +231,10 @@ def plot_taz(
         geojson=geojson,
         locations=feature_ids,
         featureidkey="id",
-        z=np.ones(len(wgs84)),
-        colorscale=[[0.0, fill_color], [1.0, fill_color]],
+        z=color_values,
+        zmin=0,
+        zmax=max(len(colors) - 1, 1),
+        colorscale=_categorical_colorscale(colors),
         showscale=False,
         marker={
             "opacity": float(opacity),
@@ -187,7 +245,7 @@ def plot_taz(
         name="Traffic analysis zones",
     ))
     figure.update_layout(
-        title="Traffic analysis zones",
+        title="Interactive TAZ zone overlay",
         mapbox={"style": basemap_style, "center": center, "zoom": zoom},
         margin={"l": 0, "r": 0, "t": 45, "b": 0},
         height=760,
