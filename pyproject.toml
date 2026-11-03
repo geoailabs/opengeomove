@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opengeomove"
+version = "0.1.0"
+description = "Geospatial analysis for urban mobility"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["geospatial", "mobility", "transportation", "duckdb", "gis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "duckdb",
+    "matplotlib",
+    "geopandas>=0.14",
+    "shapely>=2.1",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "pyproj>=3.5",
+    "rasterio>=1.3",
+    "networkx>=3",
+    "pymetis>=2023.1",
+    "scikit-learn>=1.3",
+    "osmnx>=1.9",
+    "centerline>=1.1",
+    "plotly>=5.20,<6.0",
+    "google-auth>=2.0",
+    "google-cloud-storage>=2.0",
+    "s2sphere>=0.2.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/geoailabs/opengeomove"
+Repository = "https://github.com/geoailabs/opengeomove.git"
+Issues = "https://github.com/geoailabs/opengeomove/issues"
+
+[tool.setuptools]
+package-dir = { opengeomove = "." }
+packages = [
+    "opengeomove",
+    "opengeomove.data_cleaning",
+    "opengeomove.data_loading",
+    "opengeomove.eda",
+    "opengeomove.mobility",
+    "opengeomove.plots",
+    "opengeomove.taz",
+]
