@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from opengeomove.eda.operations import (
     describe,
@@ -17,6 +17,11 @@ from opengeomove.eda.operations import (
     nunique,
     unique,
     value_counts,
+)
+from opengeomove.eda.device_clustering import (
+    DeviceClusterResult,
+    build_device_features,
+    cluster_devices,
 )
 
 if TYPE_CHECKING:
@@ -139,3 +144,68 @@ class EDAAccessor:
     def notnull(self: Dataset) -> Dataset:
         """Alias for :meth:`notna`."""
         return notnull(self)
+
+    def build_device_features(
+        self: Dataset,
+        *,
+        device_id_col: str = "device_id",
+        trajectory_id_col: str = "trajectory_id",
+        trajectory_date_col: str = "trajectory_date",
+        trajectory_distance_col: str = "trajectory_distance_m",
+        visit_order_col: str = "visit_order",
+        stay_point_col: str = "stay_point",
+        grid_col: str = "spatial_cluster_label",
+        lat_col: str = "lat",
+        lon_col: str = "lon",
+        trajectory_start_col: str = "trajectory_start_time",
+    ) -> Dataset:
+        """Aggregate a trajectory-visit Dataset into device mobility features.
+
+        The operation is lazy and keeps trajectory, daily, and anchor
+        aggregation in DuckDB. See :func:`opengeomove.build_device_features`
+        for the feature definitions and column mapping.
+        """
+        return build_device_features(
+            self,
+            device_id_col=device_id_col,
+            trajectory_id_col=trajectory_id_col,
+            trajectory_date_col=trajectory_date_col,
+            trajectory_distance_col=trajectory_distance_col,
+            visit_order_col=visit_order_col,
+            stay_point_col=stay_point_col,
+            grid_col=grid_col,
+            lat_col=lat_col,
+            lon_col=lon_col,
+            trajectory_start_col=trajectory_start_col,
+        )
+
+    def cluster_devices(
+        self: Dataset,
+        *,
+        device_id_col: str = "device_id",
+        feature_columns: Sequence[str] | None = None,
+        n_clusters: int = 5,
+        scale: str = "standard",
+        missing: str = "median",
+        random_state: int | None = 42,
+        n_init: int = 10,
+        labels: Mapping[int, str] | None = None,
+    ) -> DeviceClusterResult:
+        """Fit KMeans to a one-row-per-device feature Dataset.
+
+        KMeans materializes only the projected device-feature matrix. The
+        return value exposes assignment, raw-profile, and normalized-profile
+        Datasets through ``assignments``, ``profiles``, and
+        ``normalized_profiles``.
+        """
+        return cluster_devices(
+            self,
+            device_id_col=device_id_col,
+            feature_columns=feature_columns,
+            n_clusters=n_clusters,
+            scale=scale,
+            missing=missing,
+            random_state=random_state,
+            n_init=n_init,
+            labels=labels,
+        )

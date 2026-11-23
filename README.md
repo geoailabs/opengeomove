@@ -18,6 +18,8 @@ early releases.
 - Compose read-only filters for device IDs, accuracy, timestamps, daily ping
   counts, and polygons.
 - Detect stops, form trips, and classify recurring home and work locations.
+- Build twenty-feature device mobility profiles and cluster devices with
+  reproducible five-cluster KMeans.
 - Plot bounded samples of GPS pings, with optional XYZ basemap tiles.
 - Create, compare, classify, and visualize traffic analysis zones using
   population, road, building, and land-use evidence.
@@ -93,6 +95,21 @@ stops = filtered.cluster_stops(
 )
 trips = stops.form_trips(thresholds=thresholds)
 ```
+
+For the current trajectory-visit output, build the slide's device profiles and
+fit five KMeans clusters:
+
+```python
+features = ogm.open("daily_trajectory_visit_sequences.parquet").build_device_features()
+clusters = features.cluster_devices(n_clusters=5, random_state=42)
+print(clusters.assignments.head())
+print(clusters.normalized_profiles)
+```
+
+`clusters.profiles` contains raw cluster means and `device_count`; the
+min-max-normalized `clusters.normalized_profiles` is suitable for reproducing
+the feature-profile heatmap. The feature aggregation remains in DuckDB, while
+KMeans materializes only the device-level feature matrix.
 
 ### Traffic analysis zones
 
