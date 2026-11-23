@@ -5,6 +5,11 @@ import tempfile
 import unittest
 
 import duckdb
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 
 import opengeomove as ogm
 
@@ -41,6 +46,7 @@ class DeviceClusteringTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         """Close DuckDB and remove the temporary fixture."""
+        plt.close("all")
         self.dataset._connection.close()
         self._temporary_directory.cleanup()
 
@@ -75,6 +81,14 @@ class DeviceClusteringTests(unittest.TestCase):
         self.assertTrue(
             all(0.0 <= value <= 1.0 for row in normalized for value in row[3:])
         )
+
+        figure = first.plot_profiles()
+        try:
+            self.assertEqual(len(figure.axes[0].patches), 5)
+            self.assertEqual(len(figure.axes[1].images), 1)
+            self.assertEqual(len(figure.axes[1].get_yticklabels()), 20)
+        finally:
+            plt.close(figure)
 
     def test_cluster_devices_rejects_duplicate_device_rows(self) -> None:
         """Require a device feature table to contain one row per device."""

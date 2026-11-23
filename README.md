@@ -104,6 +104,8 @@ features = ogm.open("daily_trajectory_visit_sequences.parquet").build_device_fea
 clusters = features.cluster_devices(n_clusters=5, random_state=42)
 print(clusters.assignments.head())
 print(clusters.normalized_profiles)
+figure = clusters.plot_profiles()
+figure.savefig("device_clusters.png", dpi=150)
 ```
 
 `clusters.profiles` contains raw cluster means and `device_count`; the

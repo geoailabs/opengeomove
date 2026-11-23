@@ -459,6 +459,102 @@ class DeviceClusterResult:
         """Return the number of clusters fitted by KMeans."""
         return int(self.model.n_clusters)
 
+    def plot_profiles(
+        self,
+        *,
+        figsize: tuple[float, float] = (14.0, 8.0),
+        cmap: str = "viridis",
+        show: bool = False,
+    ) -> Any:
+        """Plot cluster sizes beside the normalized feature-profile heatmap.
+
+        The heatmap uses :attr:`normalized_profiles`, whose feature values are
+        min–max normalized across clusters. The bar chart uses the recorded
+        ``device_count`` in :attr:`profiles`; neither panel recomputes or
+        re-reads the original trajectory source.
+
+        Args:
+            figsize: Matplotlib figure size in inches as ``(width, height)``.
+            cmap: Matplotlib colormap used for the heatmap.
+            show: If true, call ``matplotlib.pyplot.show()`` before returning.
+
+        Returns:
+            The Matplotlib Figure containing the bar chart, heatmap, and
+            heatmap colorbar. Call ``savefig`` on the returned figure to write
+            an image without displaying it.
+
+        Raises:
+            TypeError: If ``figsize``, ``cmap``, or ``show`` has an invalid
+                type.
+            ValueError: If ``figsize`` is not positive in both dimensions.
+            ImportError: If Matplotlib is unavailable.
+        """
+        if (
+            isinstance(figsize, (str, bytes))
+            or not isinstance(figsize, tuple)
+            or len(figsize) != 2
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in figsize)
+        ):
+            raise TypeError("figsize must be a (width, height) tuple of numbers")
+        if figsize[0] <= 0 or figsize[1] <= 0:
+            raise ValueError("figsize values must be positive")
+        if not isinstance(cmap, str) or not cmap:
+            raise TypeError("cmap must be a non-empty string")
+        if not isinstance(show, bool):
+            raise TypeError("show must be a bool")
+
+        import matplotlib.pyplot as plt
+
+        columns = tuple(self.normalized_profiles.columns)
+        profile_rows = list(self.normalized_profiles.rows)
+        profile_frame = pd.DataFrame(profile_rows, columns=columns)
+        if profile_frame.empty:
+            raise ValueError("No cluster profiles are available to plot")
+        missing = [column for column in ("cluster_id", "device_count", *self.feature_columns) if column not in profile_frame]
+        if missing:
+            raise ValueError(f"Cluster profiles are missing plotting columns: {missing!r}")
+
+        cluster_ids = profile_frame["cluster_id"].astype(int).to_numpy()
+        feature_matrix = profile_frame.loc[:, self.feature_columns].to_numpy(dtype=float)
+        counts = profile_frame["device_count"].astype(int).to_numpy()
+        figure, axes = plt.subplots(
+            1,
+            2,
+            figsize=(float(figsize[0]), float(figsize[1])),
+            gridspec_kw={"width_ratios": (1.0, 1.8)},
+        )
+        size_axes, heatmap_axes = axes
+        size_axes.bar(cluster_ids, counts, color="#3f7896")
+        size_axes.set_title("Device count by cluster")
+        size_axes.set_xlabel("Cluster")
+        size_axes.set_ylabel("Number of devices")
+        size_axes.set_xticks(cluster_ids)
+
+        image = heatmap_axes.imshow(
+            feature_matrix,
+            aspect="auto",
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+        )
+        heatmap_axes.set_title(
+            "Home-start anchor-spread clustering: normalized cluster profile"
+        )
+        heatmap_axes.set_xlabel("Cluster")
+        heatmap_axes.set_ylabel("Feature")
+        heatmap_axes.set_xticks(np.arange(len(cluster_ids)))
+        heatmap_axes.set_xticklabels(cluster_ids)
+        heatmap_axes.set_yticks(np.arange(len(self.feature_columns)))
+        heatmap_axes.set_yticklabels(self.feature_columns)
+        heatmap_axes.tick_params(axis="y", labelsize=8)
+        colorbar = figure.colorbar(image, ax=heatmap_axes)
+        colorbar.set_label("Min-max normalized cluster mean")
+        figure.suptitle("Device clustering")
+        figure.tight_layout()
+        if show:
+            plt.show()
+        return figure
+
 
 def cluster_devices(
     dataset: Dataset,
