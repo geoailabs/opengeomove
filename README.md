@@ -23,6 +23,8 @@ early releases.
 - Plot bounded samples of GPS pings, with optional XYZ basemap tiles.
 - Create, compare, classify, and visualize traffic analysis zones using
   population, road, building, and land-use evidence.
+- Fetch historical daily weather and render quantitative weather overlays on
+  generated or existing traffic analysis zones.
 
 ## Installation
 
@@ -128,6 +130,23 @@ zones = ogm.taz.create_taz(
 figure = ogm.taz.plot_taz(zones)
 figure.show()
 ```
+
+Historical weather can be attached to the same zones and plotted with a
+continuous color scale:
+
+```python
+overlay = ogm.weather.overlay(
+    zones,
+    date="2024-07-15",
+    variable="precipitation_sum",
+    source="open_meteo",
+    timezone="Asia/Kolkata",
+)
+overlay.plot().show()
+```
+
+See [`docs/weather.md`](../docs/weather.md) for supported variables, date
+semantics, and provider behavior.
 
 Automatic road- and building-aware TAZ generation can download external OSM
 and Google Open Buildings data when explicitly configured. Those workflows may

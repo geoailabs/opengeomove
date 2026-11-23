@@ -59,4 +59,5 @@ packages = [
     "opengeomove.mobility",
     "opengeomove.plots",
     "opengeomove.taz",
+    "opengeomove.weather",
 ]

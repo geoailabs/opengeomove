@@ -12,6 +12,7 @@ from opengeomove.eda.device_clustering import (
     cluster_devices,
 )
 from opengeomove import taz
+from opengeomove import weather
 
 __all__ = [
     "Dataset",
@@ -26,4 +27,5 @@ __all__ = [
     "build_device_features",
     "cluster_devices",
     "taz",
+    "weather",
 ]
